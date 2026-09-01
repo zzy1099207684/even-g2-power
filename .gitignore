@@ -42,3 +42,4 @@ dist/
 .venv
 *.log
 .zcode
+.mp3
