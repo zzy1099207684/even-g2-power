@@ -7,25 +7,31 @@
 // segments.
 //
 // Two independent "views" onto the same data:
-//   - glasses: live = full continuous text (tail shown); scrolling back trims
-//     whole segments off the tail of BOTH lanes — segments are pairs in
-//     `history`, so original and translation stay aligned while scrolling,
-//     and the view slides smoothly instead of jumping to another entry. Any
-//     new content snaps back to live.
-//   - phone: the full live text in a CSS scroll box — free to browse without
-//     being interrupted by new content.
+//   - glasses: live = tail of the continuous text (tail shown); scrolling
+//     back trims whole segments off the tail of BOTH lanes — segments are
+//     pairs, so original and translation stay aligned while scrolling, and
+//     the view slides smoothly instead of jumping to another entry. Any new
+//     content snaps back to live.
+//   - phone: the full log as line arrays in a CSS scroll box — free to
+//     browse without being interrupted by new content.
+//
+// Storage is line arrays, never one growing string: the transcript only
+// ever grows, so a whole-document string would be rebuilt and copied on
+// every STT partial (several per second). The glasses getters instead serve
+// a cached tail window of the sealed text — big enough that render.ts's
+// fitTail (which itself only measures a maxLines*100-char suffix window)
+// returns exactly what it would from the full text.
 
-export interface TranscriptEntry {
-  original: string
-  translation: string
-}
+// Sealed-tail window served to the glasses. Must cover the largest fitTail
+// measure window (9 lines * 100 chars = 900, render.ts FULL_BOX) with
+// margin, so a fitTail call on this suffix equals a call on the full text.
+const SEALED_TAIL_CHARS = 1000
 
 export interface Transcript {
   updateCurrentOriginal(text: string): void
-  updateCurrentTranslation(text: string): void
-  /** Original sealed into the log (forced cut or EndOfTurn). */
+  /** Original sealed into the log (clause cut, length backstop or EndOfTurn). */
   commitOriginal(text: string): void
-  /** Translation finalized for the segment whose original was just committed. */
+  /** Translation finalized for the oldest original still waiting to be paired. */
   commitTranslation(text: string): void
 
   scrollOlder(): void
@@ -36,6 +42,13 @@ export interface Transcript {
   getGlassesTranslation(): string
   getFullOriginal(): string
   getFullTranslation(): string
+
+  /** Sealed original segments in order — phone mirror renders these incrementally. */
+  getOriginalLines(): readonly string[]
+  /** Sealed (already paired) translations in order. */
+  getTranslationLines(): readonly string[]
+  /** The still-revising live original line, '' when nothing is live. */
+  getCurrentOriginal(): string
 }
 
 // Sealed + current join with a newline: every sealed segment starts on its
@@ -49,51 +62,79 @@ function joinLane(sealed: string, current: string): string {
   return `${sealed}\n${current}`
 }
 
+// Append one sealed segment to a tail window, keeping at most the last
+// SEALED_TAIL_CHARS characters. Any slice point yields a true suffix of the
+// full text, which is all fitTail's window math requires.
+function appendTail(tail: string, text: string): string {
+  const next = tail ? `${tail}\n${text}` : text
+  return next.length > SEALED_TAIL_CHARS ? next.slice(next.length - SEALED_TAIL_CHARS) : next
+}
+
 export function createTranscript(): Transcript {
-  const history: TranscriptEntry[] = []
-  let sealedOriginal = ''
-  let sealedTranslation = ''
+  // Sealed segments, append-only. origLines includes originals whose
+  // translation hasn't landed yet; transLines holds only paired ones —
+  // translation pairs with the oldest pending original, FIFO.
+  const origLines: string[] = []
+  const transLines: string[] = []
+  // Originals sealed but not yet paired with a translation, in order. A
+  // queue, not a single slot: clauses seal faster than translations come
+  // back, so several can be waiting when the next translation lands.
+  const pendingOriginals: string[] = []
   let currentOriginal = ''
-  let currentTranslation = ''
-  let pendingOriginal: string | null = null
+  // Cached tails of the sealed lanes (last SEALED_TAIL_CHARS chars) —
+  // rebuilt incrementally on commit, so per-partial glasses reads stay O(1)
+  // in conversation length.
+  let origTail = ''
+  let transTail = ''
   // Browse position in segments back from live (0 = live tail). 1 shows every
   // sealed segment but not the still-changing current one; each further step
   // trims one more segment off the tail — same segment from both lanes, so
-  // they scroll in lockstep.
+  // they scroll in lockstep. Scrolling only ever sees paired segments, so
+  // both lanes move by transLines.length.
   let scrollBack = 0
 
-  // The scrolled-back view: history minus the trimmed tail, newline-joined.
-  const scrolled = (pick: (e: TranscriptEntry) => string): string =>
-    history
-      .slice(0, Math.max(0, history.length - (scrollBack - 1)))
-      .map(pick)
-      .join('\n')
+  // The scrolled-back view: paired segments minus the trimmed tail,
+  // newline-joined. Only the suffix fitTail can still see is joined — walk
+  // backward from the trim point until SEALED_TAIL_CHARS accumulates (the
+  // same window math as the live-tail caches: 1000 ≥ fitTail's 900-char
+  // measure window, so a fitTail call on this suffix equals one on the full
+  // join). Cost is constant in conversation length; output identical.
+  // Only runs on a scroll gesture.
+  const scrolled = (pick: (i: number) => string): string => {
+    const end = Math.max(0, transLines.length - (scrollBack - 1))
+    let first = end
+    let total = 0
+    while (first > 0) {
+      total += pick(first - 1).length + 1
+      first--
+      if (total >= SEALED_TAIL_CHARS) break
+    }
+    const parts: string[] = []
+    for (let i = first; i < end; i++) parts.push(pick(i))
+    return parts.join('\n')
+  }
 
   return {
     updateCurrentOriginal(text) {
       currentOriginal = text
       scrollBack = 0
     },
-    updateCurrentTranslation(text) {
-      currentTranslation = text
-      scrollBack = 0
-    },
     commitOriginal(text) {
-      sealedOriginal = joinLane(sealedOriginal, text)
-      pendingOriginal = text
+      origLines.push(text)
+      origTail = appendTail(origTail, text)
+      pendingOriginals.push(text)
       currentOriginal = ''
       scrollBack = 0
     },
     commitTranslation(text) {
-      if (pendingOriginal === null) return // no sealed original waiting — nothing to pair it with
-      history.push({ original: pendingOriginal, translation: text })
-      pendingOriginal = null
-      sealedTranslation = joinLane(sealedTranslation, text)
-      currentTranslation = ''
+      const original = pendingOriginals.shift()
+      if (original === undefined) return // no sealed original waiting — nothing to pair it with
+      transLines.push(text)
+      transTail = appendTail(transTail, text)
       scrollBack = 0
     },
     scrollOlder() {
-      scrollBack = Math.min(scrollBack + 1, history.length)
+      scrollBack = Math.min(scrollBack + 1, transLines.length)
     },
     scrollNewer() {
       scrollBack = Math.max(0, scrollBack - 1)
@@ -102,20 +143,25 @@ export function createTranscript(): Transcript {
       return scrollBack === 0
     },
     getGlassesOriginal() {
-      return scrollBack === 0
-        ? joinLane(sealedOriginal, currentOriginal)
-        : scrolled(e => e.original)
+      return scrollBack === 0 ? joinLane(origTail, currentOriginal) : scrolled(i => origLines[i])
     },
     getGlassesTranslation() {
-      return scrollBack === 0
-        ? joinLane(sealedTranslation, currentTranslation)
-        : scrolled(e => e.translation)
+      return scrollBack === 0 ? transTail : scrolled(i => transLines[i])
     },
     getFullOriginal() {
-      return joinLane(sealedOriginal, currentOriginal)
+      return joinLane(origLines.join('\n'), currentOriginal)
     },
     getFullTranslation() {
-      return joinLane(sealedTranslation, currentTranslation)
+      return transLines.join('\n')
+    },
+    getOriginalLines() {
+      return origLines
+    },
+    getTranslationLines() {
+      return transLines
+    },
+    getCurrentOriginal() {
+      return currentOriginal
     },
   }
 }

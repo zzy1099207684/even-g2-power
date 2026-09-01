@@ -40,3 +40,5 @@ dist/
 **/__pycache__/
 *_cache
 .venv
+*.log
+.zcode

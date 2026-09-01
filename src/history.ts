@@ -3,6 +3,11 @@
 // webview's localStorage, which the host app may wipe.
 
 import { waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
+import {
+  DEFAULT_HISTORY_MAX_RECORDS,
+  DEFAULT_HISTORY_RETENTION_DAYS,
+  loadUiConfig,
+} from './config'
 
 export interface SessionRecord {
   id: string
@@ -15,26 +20,51 @@ export interface SessionRecord {
 
 const STORAGE_KEY = 'g2-translate-history'
 
-export async function listRecords(): Promise<SessionRecord[]> {
+// Retention limits are user-configurable (Settings → History); the defaults
+// in config.ts apply when no saved config says otherwise. prune() runs on the
+// add path — the only place the archive grows.
+
+// Distinguishes "no records yet" ([]) from "storage read failed" (null).
+// The write paths must never treat a failed read as an empty archive —
+// persisting over it would wipe every saved session.
+async function readRecords(): Promise<SessionRecord[] | null> {
   try {
     const bridge = await waitForEvenAppBridge()
     const raw = await bridge.getLocalStorage(STORAGE_KEY)
     const parsed = raw ? JSON.parse(raw) : []
     return Array.isArray(parsed) ? (parsed as SessionRecord[]) : []
   } catch {
-    return []
+    return null
   }
 }
 
-// Newest first: prepend, then persist.
+export async function listRecords(): Promise<SessionRecord[]> {
+  return (await readRecords()) ?? []
+}
+
+// Drops records past the retention window, then the overflow past the count
+// cap. Records are newest first, so the slice keeps the newest.
+function prune(records: SessionRecord[], retentionMs: number, maxRecords: number): SessionRecord[] {
+  const cutoff = Date.now() - retentionMs
+  return records.filter(r => r.savedAt >= cutoff).slice(0, maxRecords)
+}
+
+// Newest first: prepend, then persist. A failed read aborts the save — the
+// new record is lost this once, but the archive is never overwritten blank.
 export async function addRecord(record: SessionRecord): Promise<void> {
-  const records = await listRecords()
+  const records = await readRecords()
+  if (records === null) throw new Error('history read failed — refusing to overwrite the archive')
+  const cfg = await loadUiConfig()
+  const retentionDays = cfg?.historyRetentionDays ?? DEFAULT_HISTORY_RETENTION_DAYS
+  const maxRecords = cfg?.historyMaxRecords ?? DEFAULT_HISTORY_MAX_RECORDS
   records.unshift(record)
-  await persist(records)
+  await persist(prune(records, retentionDays * 24 * 60 * 60 * 1000, maxRecords))
 }
 
 export async function deleteRecord(id: string): Promise<void> {
-  await persist((await listRecords()).filter(r => r.id !== id))
+  const records = await readRecords()
+  if (records === null) return // read failed — rewriting would wipe the archive
+  await persist(records.filter(r => r.id !== id))
 }
 
 export async function getRecord(id: string): Promise<SessionRecord | null> {

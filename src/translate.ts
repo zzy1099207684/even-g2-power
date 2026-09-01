@@ -1,77 +1,118 @@
-// Calls the relay's /translate endpoint (DeepSeek deepseek-v4-flash, thinking
-// disabled) and renders a live-updating translation as the source utterance
-// is still being spoken.
-//
-// Retranslating the whole growing sentence on every partial risks the
-// already-displayed text changing wording as more context arrives — jarring
-// on a glasses display. This uses the "Local Agreement" policy real-time
-// translation products use for exactly this problem: after each retranslate,
-// only the prefix that agrees with the PREVIOUS translation is locked in
-// (committedPrefix, monotonic — never shrinks even if a later call disagrees
-// with an already-locked part); only the tail beyond it is shown as still
-// tentative. submitFinal (EndOfTurn) skips that caution and commits outright.
+// Translates sealed segments, one request per segment, strictly in order.
+// Clause-sized segments are sealed faster than translations come back, so
+// requests queue up and run one at a time: an in-flight request is never
+// aborted (that would silently lose that segment's translation), and
+// onCommit fires in speech order, which transcript.ts's FIFO pairing relies
+// on. The relay is a dumb forwarder: each request carries the model to use
+// (endpoint URL, model name, API key — any OpenAI-compatible
+// /chat/completions provider), polled fresh per request so a mid-session
+// model switch applies from the next segment on.
+
+import type { ModelProfile } from './config'
 
 export interface TranslationSession {
-  /** Call on each growing partial transcript. Throttled/coalesced internally. */
-  submitPartial(text: string): void
-  /** Call once when the utterance is finalized (EndOfTurn). */
+  /** Call once per sealed segment. Queued; translated strictly in order. */
   submitFinal(text: string): void
   dispose(): void
 }
 
-const MIN_PARTIAL_INTERVAL_MS = 500
-// A hung request must not hold the session's in-flight slot forever — every
-// later submitPartial would be skipped and translation would look "stopped".
-const REQUEST_TIMEOUT_MS = 8000
+// A hung request must not stall the queue forever — the watchdog aborts it,
+// the error is surfaced, and the next segment gets its turn.
+const REQUEST_TIMEOUT_MS = 10_000
+// The phone's path to the relay is occasionally flaky (observed on device:
+// only the last queued segment ever translated). One retry keeps a transient
+// failure from silently losing a committed sentence forever.
+const MAX_ATTEMPTS = 2
+const RETRY_DELAY_MS = 800
+// Translations trail speech; when the model is persistently slower, the queue
+// would grow without bound and every translation would land minutes late —
+// long after its lines scrolled off the glasses. Past this many queued
+// segments, the oldest still-queued one is sacrificed (see submitFinal), so
+// the newest speech keeps translating near-live. One lost old translation
+// beats the whole lane lagging behind the conversation.
+const MAX_PENDING = 8
 
-function longestCommonPrefix(a: string, b: string): string {
-  let i = 0
-  const len = Math.min(a.length, b.length)
-  while (i < len && a[i] === b[i]) i++
-  return a.slice(0, i)
+// One queued segment. `dropped` marks a backlog-overflow victim: pump hands
+// it back untranslated instead of translating it.
+interface QueuedSegment {
+  text: string
+  dropped?: boolean
 }
 
 export function createTranslationSession(
   relayUrl: string,
   /** Translation target, as a natural-language name the model understands. */
   targetLang: string,
-  render: (text: string) => void,
-  /** Fires once per utterance, when its translation is finalized. */
+  /** Fires per segment, in speech order, when its translation is done. */
   onCommit: (text: string) => void,
   onError?: (err: unknown) => void,
+  /** Prior conversation text for the model to reference (never translate);
+   *  polled fresh on every request so the window slides as segments seal. */
+  getContext?: () => string,
+  /** The model to use, polled fresh on every request so a mid-session switch
+   *  applies from the next request on. */
+  getModel?: () => ModelProfile | null,
 ): TranslationSession {
-  let inFlight = false
-  let lastRequestAt = 0
-  let lastSourceText = '' // source text the most recent request was for
-  let lastTranslation = '' // its completed result (may still be revised by the next call)
-  let committedPrefix = '' // prefix of lastTranslation locked in, never shrinks
-  let controller: AbortController | null = null
+  const queue: QueuedSegment[] = []
+  let pumping = false
+  let disposed = false
+  let current: AbortController | null = null
 
-  function resetForNextUtterance() {
-    lastSourceText = ''
-    lastTranslation = ''
-    committedPrefix = ''
+  async function pump() {
+    if (pumping) return
+    pumping = true
+    try {
+      while (queue.length > 0 && !disposed) {
+        const entry = queue.shift()!
+        if (entry.dropped) {
+          // Backlog overflow victim: hand the original back untranslated. It
+          // fires HERE, in queue order — dropping it with an immediate
+          // onCommit at submit time could overtake an older in-flight
+          // request and mispair transcript.ts's FIFO lanes.
+          onCommit(entry.text)
+          continue
+        }
+        await runTranslate(entry.text)
+      }
+    } finally {
+      pumping = false
+    }
   }
 
-  async function runTranslate(text: string, isFinal: boolean) {
-    const myController = new AbortController()
-    controller = myController
-    inFlight = true
-    lastRequestAt = Date.now()
-    lastSourceText = text
+  async function runTranslate(text: string) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      if (await attemptTranslate(text)) return
+      if (disposed || attempt >= MAX_ATTEMPTS) break
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+    }
+    // Every attempt failed: pass the original through as its own translation.
+    // transcript.ts pairs originals and translations FIFO — a segment that
+    // commits nothing would shift every later pairing by one.
+    if (!disposed) onCommit(text)
+  }
 
+  /** Runs one request for the segment; true when it completed (or is hopeless). */
+  async function attemptTranslate(text: string): Promise<boolean> {
+    const model = getModel?.()
+    if (!model || !model.url || !model.name || !model.key) {
+      onError?.(new Error('No model configured — add one in Settings'))
+      return true
+    }
+
+    const abort = new AbortController()
+    current = abort
     let timedOut = false
     const watchdog = setTimeout(() => {
       timedOut = true
-      myController.abort()
+      abort.abort()
     }, REQUEST_TIMEOUT_MS)
 
     try {
       const res = await fetch(`${relayUrl}/translate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, targetLang }),
-        signal: myController.signal,
+        body: JSON.stringify({ text, targetLang, context: getContext?.(), model }),
+        signal: abort.signal,
       })
       if (!res.ok || !res.body) throw new Error(`translate request failed: ${res.status}`)
 
@@ -97,54 +138,36 @@ export function createTranslationSession(
         }
       }
 
-      if (isFinal) {
-        // Commit ends the segment: onCommit archives the translation into the
-        // transcript. Rendering here as well would ALSO put the same text
-        // into the live view, so the segment would show up twice (history +
-        // current) until the next partial overwrote it.
-        committedPrefix = full
-        lastTranslation = full
-        onCommit(full)
-        return
-      }
-      const agreed = longestCommonPrefix(lastTranslation, full)
-      if (agreed.length > committedPrefix.length) committedPrefix = agreed
-      lastTranslation = full
-      render(committedPrefix + full.slice(committedPrefix.length))
+      onCommit(full)
+      return true
     } catch (err) {
       if (timedOut) onError?.(new Error('translate request timed out'))
-      else if ((err as Error)?.name !== 'AbortError') onError?.(err)
+      else if (!disposed && (err as Error)?.name !== 'AbortError') onError?.(err)
+      return false
     } finally {
       clearTimeout(watchdog)
-      // A newer call may already have replaced `controller` (submitFinal
-      // aborts and immediately starts one) — only the current owner clears it.
-      if (controller === myController) {
-        inFlight = false
-        controller = null
-      }
+      if (current === abort) current = null
     }
   }
 
   return {
-    submitPartial(text) {
-      if (!text || text === lastSourceText) return
-      if (inFlight) return
-      if (Date.now() - lastRequestAt < MIN_PARTIAL_INTERVAL_MS) return
-      runTranslate(text, false)
-    },
     submitFinal(text) {
-      if (!inFlight && text === lastSourceText && lastTranslation) {
-        // Already fully translated by the last partial — archive it directly.
-        // No render: the live view already holds this text.
-        onCommit(lastTranslation)
-        resetForNextUtterance()
-        return
+      if (!text) return
+      // Over budget: sacrifice the oldest still-queued segment — mark it so
+      // pump passes it through untranslated when its turn comes. Marking
+      // keeps commit order intact (see pump); the newest speech keeps
+      // translating near-live instead of the whole lane drifting behind.
+      if (queue.length >= MAX_PENDING) {
+        const victim = queue.find(entry => !entry.dropped)
+        if (victim) victim.dropped = true
       }
-      controller?.abort()
-      runTranslate(text, true).then(resetForNextUtterance)
+      queue.push({ text })
+      pump()
     },
     dispose() {
-      controller?.abort()
+      disposed = true
+      queue.length = 0
+      current?.abort()
     },
   }
 }

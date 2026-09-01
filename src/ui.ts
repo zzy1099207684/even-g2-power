@@ -4,8 +4,20 @@
 // through the async record helpers in history.ts.
 
 import { listRecords, getRecord, deleteRecord, type SessionRecord } from './history'
+import {
+  DEFAULT_HISTORY_MAX_RECORDS,
+  DEFAULT_HISTORY_RETENTION_DAYS,
+  saveUiConfig,
+  type ModelProfile,
+  type SessionConfig,
+  type UiConfig,
+} from './config'
 
+// Bound to Soniox stt-rt-v5 (60+ languages with per-token language
+// identification — Chinese included, which the previous Deepgram model
+// couldn't do).
 const ASR_LANGUAGES = [
+  { code: 'zh', label: 'Chinese' },
   { code: 'en', label: 'English' },
   { code: 'es', label: 'Spanish' },
   { code: 'fr', label: 'French' },
@@ -19,7 +31,7 @@ const ASR_LANGUAGES = [
 ]
 
 // Any language DeepSeek writes well is a valid target; the ASR list above is
-// the one bound to Deepgram's model.
+// the one bound to the Soniox model.
 const TARGET_LANGUAGES = [
   { code: 'zh-Hans', label: 'Chinese (Simplified)' },
   { code: 'zh-Hant', label: 'Chinese (Traditional)' },
@@ -37,32 +49,181 @@ const TARGET_LANGUAGES = [
 ]
 
 // Selection survives leaving and re-entering the settings screen (record
-// detail, running session).
-const selectedSources = new Set<string>(['de'])
+// detail, running session). The service configuration (relay, Soniox key,
+// model profiles) is loaded from storage at mount and edited through the
+// Settings modal.
+let selectedSources = new Set<string>(['en', 'de'])
 let selectedTarget = TARGET_LANGUAGES[0].code
+let relayUrl = ''
+let sonioxKey = ''
+let models: ModelProfile[] = []
+let selectedModelId = ''
+// Session-archive retention (Settings → History). Defaults until a saved or
+// restored config says otherwise.
+let historyRetentionDays = DEFAULT_HISTORY_RETENTION_DAYS
+let historyMaxRecords = DEFAULT_HISTORY_MAX_RECORDS
 
 type StatusKind = 'listening' | 'error'
 
 export interface RunningUiHandle {
   setStatus(kind: StatusKind, text: string): void
-  setOriginalMirror(text: string): void
-  setTranslationMirror(text: string): void
+  /** Sealed original lines plus the live (still-revising) line — synced incrementally. */
+  setOriginalMirror(sealed: readonly string[], current: string): void
+  /** Sealed translation lines — synced incrementally. */
+  setTranslationMirror(sealed: readonly string[]): void
   setPaused(paused: boolean): void
+  /** TEMPORARY: STT pipeline diagnostics, remove after debugging. */
+  setDebug(text: string): void
 }
 
 export interface UiHandle {
   showConnecting(): void
   showStartError(message: string): void
-  /** Back to the settings screen, e.g. after End — no error banner. */
-  showSettings(): void
   showRunning(): RunningUiHandle
+  /** Apply the restored last-used selection; re-renders only if on settings. */
+  applyConfig(config: UiConfig): void
 }
 
 export interface UiCallbacks {
-  onStart(sources: string[], targetLang: string): void
+  onStart(sources: string[], targetCode: string, targetLabel: string, session: SessionConfig): void
   onPause(): void
   onResume(): void
   onEnd(): void
+}
+
+/** The profile the dropdowns currently point at — the model translation uses. */
+export function getSelectedModel(): ModelProfile | null {
+  return models.find(m => m.id === selectedModelId) ?? null
+}
+
+// iOS keyboards strip the scheme as fast as users type it ("host.tld" without
+// https:// fails natively with "The string did not match the expected
+// pattern"), so scheme-less URLs get https:// assumed everywhere the value is
+// read. An explicit scheme the user typed is preserved.
+function withHttps(url: string): string {
+  const trimmed = url.trim()
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)) return trimmed
+  return `https://${trimmed}`
+}
+
+function isHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
+  } catch {
+    return false
+  }
+}
+
+// Compact "EN/DE → ZH" summary for the Start-screen bar and sheet header.
+function langBarText(): string {
+  const src = ASR_LANGUAGES.filter(l => selectedSources.has(l.code)).map(l => l.code.toUpperCase())
+  const tgt = selectedTarget.split('-')[0].toUpperCase()
+  return `${src.length ? src.join('/') : '···'} → ${tgt}`
+}
+
+// Shared by the page-level Start button and the sheet's Start button.
+function beginSession(callbacks: UiCallbacks, errorEl: HTMLParagraphElement): void {
+  const sources = [...selectedSources]
+  if (sources.length < 1 || sources.length > 3) {
+    errorEl.textContent = 'Pick 1 to 3 languages to listen for.'
+    return
+  }
+  // Everything the relay and session need is user-provided — nothing is
+  // baked in, so refuse to start until Settings has it all.
+  const missing: string[] = []
+  if (!relayUrl.trim()) missing.push('relay URL')
+  if (!sonioxKey.trim()) missing.push('Soniox key')
+  if (!models.length) missing.push('a model')
+  else if (!getSelectedModel()) missing.push('a selected model')
+  if (missing.length) {
+    errorEl.textContent = `Configure in Settings: ${missing.join(', ')}.`
+    return
+  }
+  errorEl.textContent = ''
+  // Remember this selection for the next open.
+  const target = TARGET_LANGUAGES.find(l => l.code === selectedTarget) ?? TARGET_LANGUAGES[0]
+  const model = getSelectedModel()!
+  void saveUiConfig(fullConfig())
+  callbacks.onStart(sources, target.code, target.label, {
+    relayUrl: relayUrl.trim().replace(/\/+$/, ''),
+    sonioxKey: sonioxKey.trim(),
+    model,
+  })
+}
+
+function fullConfig(): UiConfig {
+  return {
+    sources: [...selectedSources],
+    target: selectedTarget,
+    relayUrl,
+    sonioxKey,
+    models,
+    activeModelId: selectedModelId,
+    historyRetentionDays,
+    historyMaxRecords,
+  }
+}
+
+function isProfile(value: unknown): value is ModelProfile {
+  const m = value as ModelProfile
+  return (
+    !!m &&
+    typeof m.id === 'string' &&
+    typeof m.label === 'string' &&
+    typeof m.name === 'string' &&
+    typeof m.url === 'string' &&
+    typeof m.key === 'string'
+  )
+}
+
+// Well-known provider templates for the model cards — a convenience that
+// pre-fills name/URL/extra params and suggests model IDs. `extra` carries the
+// provider's thinking-off parameter per its official docs (identical shape
+// for DeepSeek and GLM; GLM-5.3+ forces thinking and rejects `disabled`).
+// Nothing here is user-specific: every field stays editable, "Custom" means
+// fully manual, and only the resolved fields (plus the optional extra params)
+// are ever persisted.
+const MODEL_PRESETS = [
+  { key: 'custom', label: 'Custom', name: '', url: '', extra: '', ids: [] as string[] },
+  {
+    key: 'deepseek',
+    label: 'DeepSeek',
+    name: 'DeepSeek',
+    url: 'https://api.deepseek.com/chat/completions',
+    extra: '{"thinking":{"type":"disabled"}}',
+    ids: ['deepseek-v4-flash-vision-exp', 'deepseek-chat', 'deepseek-reasoner'],
+  },
+  {
+    key: 'glm',
+    label: 'GLM',
+    name: 'GLM',
+    url: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+    extra: '{"thinking":{"type":"disabled"}}',
+    ids: ['glm-4-flash', 'glm-4.5', 'glm-4.6'],
+  },
+]
+
+// One <select> shared by the Start screen and the running screen. Changing it
+// switches the model for the next translation request, mid-session included.
+function modelSelectHtml(idAttr: string): string {
+  if (!models.length) {
+    return `<select id="${idAttr}" class="modelSelect" disabled><option>No models — open Settings</option></select>`
+  }
+  const options = models
+    .map(
+      m =>
+        `<option value="${escapeHtml(m.id)}" ${m.id === selectedModelId ? 'selected' : ''}>${escapeHtml(m.label || m.name || '(unnamed model)')}</option>`,
+    )
+    .join('')
+  return `<select id="${idAttr}" class="modelSelect">${options}</select>`
+}
+
+function wireModelSelect(app: HTMLDivElement, idAttr: string) {
+  app.querySelector<HTMLSelectElement>(`#${idAttr}`)?.addEventListener('change', event => {
+    selectedModelId = (event.target as HTMLSelectElement).value
+    void saveUiConfig(fullConfig())
+  })
 }
 
 let stylesInjected = false
@@ -85,8 +246,29 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       const err = app.querySelector<HTMLParagraphElement>('#settingsError')
       if (err) err.textContent = message
     },
-    showSettings() {
-      renderSettings(app, callbacks)
+    applyConfig(config) {
+      // Stored codes can go stale if the language lists change — keep only
+      // ones the current lists know.
+      const valid = config.sources.filter(c => ASR_LANGUAGES.some(l => l.code === c))
+      if (valid.length) selectedSources = new Set(valid)
+      if (TARGET_LANGUAGES.some(l => l.code === config.target)) selectedTarget = config.target
+      // Service configuration: accept only well-shaped profiles, and keep the
+      // active selection pointing at something that exists. URLs saved before
+      // scheme normalization existed are healed here.
+      relayUrl = withHttps(config.relayUrl)
+      sonioxKey = config.sonioxKey
+      models = config.models.filter(isProfile).map(m => ({ ...m, url: withHttps(m.url) }))
+      if (models.some(m => m.id === config.activeModelId)) selectedModelId = config.activeModelId
+      else selectedModelId = models[0]?.id ?? ''
+      // Debug payloads (dbgcfg) bypass loadUiConfig's normalization — guard
+      // instead of trusting the types.
+      if (typeof config.historyRetentionDays === 'number' && config.historyRetentionDays >= 1)
+        historyRetentionDays = config.historyRetentionDays
+      if (typeof config.historyMaxRecords === 'number' && config.historyMaxRecords >= 1)
+        historyMaxRecords = config.historyMaxRecords
+      // Re-render only while the user is still on the settings screen — they
+      // may already be past it by the time the bridge wakes up.
+      if (app.querySelector('#startBtn')) renderSettings(app, callbacks)
     },
     showRunning() {
       app.innerHTML = `
@@ -103,10 +285,15 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
             <h2>Translation</h2>
             <p id="translationMirror" class="mirrorText scrollable"></p>
           </section>
+          <div class="modelRow">
+            <h2>Model</h2>
+            ${modelSelectHtml('runModelSelect')}
+          </div>
           <div class="controls">
             <button id="pauseBtn" class="secondary">Pause</button>
             <button id="endBtn" class="secondary">End</button>
           </div>
+          <div id="debugLine" class="debugLine"></div>
           <footer>Tap glasses: toggle layout · swipe: browse history · double-tap: exit</footer>
         </main>
       `
@@ -115,6 +302,8 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       const translationEl = app.querySelector<HTMLParagraphElement>('#translationMirror')!
       const pauseBtn = app.querySelector<HTMLButtonElement>('#pauseBtn')!
       const endBtn = app.querySelector<HTMLButtonElement>('#endBtn')!
+      const debugEl = app.querySelector<HTMLDivElement>('#debugLine')!
+      wireModelSelect(app, 'runModelSelect')
 
       let paused = false
       pauseBtn.addEventListener('click', () => {
@@ -123,103 +312,106 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       })
       endBtn.addEventListener('click', () => callbacks.onEnd())
 
+      // Mirror sync: one div per sealed line, appended as lines arrive; the
+      // live line is an extra trailing div whose text is rewritten in place.
+      // Incremental so a long session never re-lays-out the whole transcript
+      // on every STT partial (the old full-text textContent swap did).
+      //
+      // The sealed divs are capped at MIRROR_MAX_LINES — the oldest are
+      // removed as new ones arrive, so the DOM stays constant-size and the
+      // per-partial scrollHeight layout read can't creep up over a long
+      // session. The full text still goes to the archive on End; only the
+      // phone's in-session scrollback is trimmed.
+      //
       // Follow new content only while the user is already at (or near) the
       // bottom — scrolling up to read history must not be yanked back down;
       // scrolling back to the bottom resumes following.
-      const setMirror = (el: HTMLParagraphElement, text: string) => {
-        const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 48
-        el.textContent = text
-        if (stick) el.scrollTop = el.scrollHeight
+      const MIRROR_MAX_LINES = 300
+      const makeMirrorSync = (el: HTMLParagraphElement) => {
+        let count = 0
+        let liveEl: HTMLDivElement | null = null
+        return (sealed: readonly string[], current?: string) => {
+          const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+          while (count < sealed.length) {
+            const line = document.createElement('div')
+            line.textContent = sealed[count++]
+            if (liveEl) el.insertBefore(line, liveEl)
+            else el.appendChild(line)
+          }
+          const sealedEls = el.childElementCount - (liveEl ? 1 : 0)
+          for (let i = sealedEls - MIRROR_MAX_LINES; i > 0; i--) el.firstElementChild!.remove()
+          if (current !== undefined) {
+            if (!liveEl) {
+              liveEl = document.createElement('div')
+              el.appendChild(liveEl)
+            }
+            liveEl.textContent = current
+          }
+          if (stick) el.scrollTop = el.scrollHeight
+        }
       }
+      const syncOriginalMirror = makeMirrorSync(originalEl)
+      const syncTranslationMirror = makeMirrorSync(translationEl)
 
       return {
         setStatus(kind, text) {
           statusEl.className = `status status-${kind}`
           statusEl.textContent = text
         },
-        setOriginalMirror(text) {
-          setMirror(originalEl, text)
+        setOriginalMirror(sealed, current) {
+          syncOriginalMirror(sealed, current)
         },
-        setTranslationMirror(text) {
-          setMirror(translationEl, text)
+        setTranslationMirror(sealed) {
+          syncTranslationMirror(sealed)
         },
         setPaused(next) {
           paused = next
           pauseBtn.textContent = paused ? 'Resume' : 'Pause'
+        },
+        setDebug(text) {
+          debugEl.textContent = text
         },
       }
     },
   }
 }
 
-// Settings screen, top to bottom: session history (newest first), the two
-// scrollable language columns (listen-for multi-select → translate-to
-// single-select), Start.
+// Settings screen, top to bottom: session history (newest first), the
+// compact language bar (opens the bottom-sheet picker), model select, Start.
 function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
   app.innerHTML = `
     <main class="panel">
-      <header><h1>G2 Translate</h1></header>
+      <header>
+        <h1>G2 Translate</h1>
+        <button id="settingsBtn" class="secondary settingsBtn">Settings</button>
+      </header>
       <section class="records">
         <h2>History</h2>
         <ul id="recordList" class="recordList"></ul>
       </section>
-      <section class="langsRow">
-        <div class="langCol">
-          <h2>Listen for <span class="hintInline">up to 3</span></h2>
-          <div class="langList">
-            ${ASR_LANGUAGES.map(
-              l => `
-              <label class="lang">
-                <input type="checkbox" value="${l.code}" ${selectedSources.has(l.code) ? 'checked' : ''} />
-                <span>${l.label}</span>
-              </label>
-            `,
-            ).join('')}
-          </div>
-        </div>
-        <div class="langArrow">→</div>
-        <div class="langCol">
-          <h2>Translate to</h2>
-          <div class="langList">
-            ${TARGET_LANGUAGES.map(
-              l => `
-              <label class="lang">
-                <input type="radio" name="targetLang" value="${l.code}" ${l.code === selectedTarget ? 'checked' : ''} />
-                <span>${l.label}</span>
-              </label>
-            `,
-            ).join('')}
-          </div>
-        </div>
-      </section>
+      <button id="langBar" class="langBar" type="button">
+        <span class="langBarText">${langBarText()}</span>
+      </button>
+      <div class="modelRow">
+        <h2>Model</h2>
+        ${modelSelectHtml('startModelSelect')}
+      </div>
       <p class="error" id="settingsError"></p>
       <button id="startBtn">Start</button>
     </main>
   `
 
-  app.querySelectorAll<HTMLInputElement>('.lang input[type="checkbox"]').forEach(input => {
-    input.addEventListener('change', () => {
-      if (input.checked) selectedSources.add(input.value)
-      else selectedSources.delete(input.value)
-    })
-  })
-  app.querySelectorAll<HTMLInputElement>('.lang input[type="radio"]').forEach(input => {
-    input.addEventListener('change', () => {
-      selectedTarget = input.value
-    })
-  })
+  app.querySelector<HTMLButtonElement>('#settingsBtn')!.addEventListener('click', () =>
+    renderSettingsPage(app, callbacks),
+  )
+  app.querySelector<HTMLButtonElement>('#langBar')!.addEventListener('click', () =>
+    renderLangSheet(app, callbacks),
+  )
+  wireModelSelect(app, 'startModelSelect')
 
   const errorEl = app.querySelector<HTMLParagraphElement>('#settingsError')!
-  const startBtn = app.querySelector<HTMLButtonElement>('#startBtn')!
-  startBtn.addEventListener('click', () => {
-    const sources = [...selectedSources]
-    if (sources.length < 1 || sources.length > 3) {
-      errorEl.textContent = 'Pick 1 to 3 languages to listen for.'
-      return
-    }
-    errorEl.textContent = ''
-    const target = TARGET_LANGUAGES.find(l => l.code === selectedTarget) ?? TARGET_LANGUAGES[0]
-    callbacks.onStart(sources, target.label)
+  app.querySelector<HTMLButtonElement>('#startBtn')!.addEventListener('click', () => {
+    beginSession(callbacks, errorEl)
   })
 
   // History fills in asynchronously — storage lives behind the bridge.
@@ -244,6 +436,364 @@ function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
 
 function sourceLabels(codes: string[]): string {
   return codes.map(c => ASR_LANGUAGES.find(l => l.code === c)?.label ?? c).join(', ')
+}
+
+// Bottom-sheet language picker (opened from the compact bar): header shows
+// the live "EN/DE → ZH" summary, below it the listen-for column (multi-select,
+// capped at 3 — extra taps are refused with a hint) and the translate-to
+// column (single-select). No confirm step: tapping a chip applies instantly,
+// Start is always reachable at the sheet's bottom. Tap the dimmed backdrop to
+// dismiss.
+function renderLangSheet(app: HTMLDivElement, callbacks: UiCallbacks) {
+  app.querySelector('.sheetScrim')?.remove()
+  const scrim = document.createElement('div')
+  scrim.className = 'sheetScrim'
+  app.appendChild(scrim)
+
+  function render() {
+    scrim.innerHTML = `
+      <div class="langSheet">
+        <div class="langSheetHead"><span class="langBarText">${langBarText()}</span></div>
+        <div class="sheetCols">
+          <div class="sheetCol">
+            <h2>Listen for <span class="hintInline">up to 3</span></h2>
+            <div class="chipList">
+              ${ASR_LANGUAGES.map(
+                l => `
+                <button type="button" class="chip ${selectedSources.has(l.code) ? 'active' : ''}" data-kind="src" data-code="${l.code}">
+                  <span>${l.label}</span><span class="hintInline">${l.code}</span>
+                </button>
+              `,
+              ).join('')}
+            </div>
+          </div>
+          <div class="sheetCol">
+            <h2>Translate to</h2>
+            <div class="chipList">
+              ${TARGET_LANGUAGES.map(
+                l => `
+                <button type="button" class="chip ${l.code === selectedTarget ? 'active' : ''}" data-kind="tgt" data-code="${l.code}">
+                  <span>${l.label}</span><span class="hintInline">${l.code.split('-')[0]}</span>
+                </button>
+              `,
+              ).join('')}
+            </div>
+          </div>
+        </div>
+        <p class="error" id="sheetError"></p>
+        <button id="sheetStart" type="button">Start</button>
+      </div>
+    `
+
+    scrim.querySelectorAll<HTMLButtonElement>('.chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const code = chip.dataset.code!
+        const hint = scrim.querySelector<HTMLParagraphElement>('#sheetError')!
+        hint.textContent = ''
+        if (chip.dataset.kind === 'src') {
+          if (selectedSources.has(code)) selectedSources.delete(code)
+          else if (selectedSources.size >= 3) {
+            hint.textContent = 'Up to 3 languages — drop one first.'
+            return
+          } else selectedSources.add(code)
+        } else {
+          selectedTarget = code
+        }
+        render()
+      })
+    })
+    scrim.querySelector<HTMLButtonElement>('#sheetStart')!.addEventListener('click', () => {
+      beginSession(callbacks, scrim.querySelector<HTMLParagraphElement>('#sheetError')!)
+    })
+  }
+
+  render()
+  scrim.addEventListener('click', event => {
+    if (event.target === scrim) {
+      scrim.remove()
+      // Sync the compact bar with whatever was picked in the sheet.
+      app.querySelector('#langBar .langBarText')!.textContent = langBarText()
+    }
+  })
+}
+
+// Standalone settings page (opened from the Start screen's Settings button).
+// Edits live in the DOM until Save: relay/key are plain inputs; each model is
+// a card whose inputs are collected on save. Fully-blank cards are dropped;
+// half-filled ones block the save so a typo can't silently produce a broken
+// profile. Back leaves without saving.
+function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
+  app.innerHTML = `
+    <main class="panel">
+      <header>
+        <button id="settingsBack" class="secondary backBtn">Back</button>
+        <h1 class="detailTitle">Settings</h1>
+      </header>
+      <div class="pageBody">
+        <label class="field">
+          <h2>Relay URL</h2>
+          <input id="relayInput" class="editTarget" type="text" inputmode="url" readonly
+            autocomplete="off" spellcheck="false"
+            placeholder="https://your-worker.workers.dev" value="${escapeHtml(relayUrl)}" />
+        </label>
+        <label class="field">
+          <h2>Soniox API Key</h2>
+          <input id="sonioxKeyInput" class="editTarget" type="password" readonly inputmode="none"
+            autocomplete="off" spellcheck="false"
+            placeholder="Your Soniox key" value="${escapeHtml(sonioxKey)}" />
+        </label>
+        <div class="fieldHeader">
+          <h2>History</h2>
+        </div>
+        <label class="field">
+          <h2>Keep sessions for (days)</h2>
+          <input id="historyDaysInput" class="hDays editTarget" type="number" inputmode="numeric" readonly
+            autocomplete="off" spellcheck="false"
+            placeholder="${DEFAULT_HISTORY_RETENTION_DAYS}" value="${historyRetentionDays}" />
+        </label>
+        <label class="field">
+          <h2>Keep at most (sessions)</h2>
+          <input id="historyCountInput" class="hCount editTarget" type="number" inputmode="numeric" readonly
+            autocomplete="off" spellcheck="false"
+            placeholder="${DEFAULT_HISTORY_MAX_RECORDS}" value="${historyMaxRecords}" />
+        </label>
+        <div class="fieldHeader">
+          <h2>Translation models</h2>
+          <button id="addModelBtn" class="secondary settingsBtn">+ Add</button>
+        </div>
+        <div id="modelRows" class="modelRows"></div>
+      </div>
+      <p class="error" id="modalError"></p>
+      <button id="modalSave">Save</button>
+    </main>
+  `
+
+  const rows = app.querySelector<HTMLDivElement>('#modelRows')!
+
+  // A preset select sits at the top of each card; picking one fills
+  // name/URL and swaps the model-ID suggestions, leaving the key alone.
+  // Custom leaves everything manual.
+  function presetKeyFor(profile: ModelProfile | null): string {
+    return MODEL_PRESETS.find(p => p.url && p.url === profile?.url)?.key ?? 'custom'
+  }
+
+  function modelCardHtml(profile: ModelProfile | null): string {
+    const id = profile?.id ?? ''
+    const key = presetKeyFor(profile)
+    const ids = MODEL_PRESETS.find(p => p.key === key)?.ids ?? []
+    return `
+      <div class="modelCard" data-id="${escapeHtml(id)}">
+        <div class="modelCardHead">
+          <select class="mPreset">
+            ${MODEL_PRESETS.map(
+              p => `<option value="${p.key}" ${p.key === key ? 'selected' : ''}>${p.label}</option>`,
+            ).join('')}
+          </select>
+          <button class="recordDelete removeModel" aria-label="Remove">✕</button>
+        </div>
+        <input class="mLabel editTarget" type="text" readonly inputmode="none"
+          autocomplete="off" spellcheck="false"
+          placeholder="NAME (shown in the list, e.g. DeepSeek)" value="${escapeHtml(profile?.label ?? '')}" />
+        <input class="mModel editTarget" type="text" readonly inputmode="none"
+          autocomplete="off" spellcheck="false" list="ids-${escapeHtml(id || 'new')}"
+          placeholder="MODEL ID (pick or type, e.g. deepseek-v4-flash)" value="${escapeHtml(profile?.name ?? '')}" />
+        <datalist id="ids-${escapeHtml(id || 'new')}">
+          ${ids.map(i => `<option value="${escapeHtml(i)}"></option>`).join('')}
+        </datalist>
+        <input class="mUrl editTarget" type="text" inputmode="url" readonly
+          autocomplete="off" spellcheck="false"
+          placeholder="URL (e.g. https://api.deepseek.com/chat/completions)" value="${escapeHtml(profile?.url ?? '')}" />
+        <input class="mKey editTarget" type="password" readonly inputmode="none"
+          autocomplete="off" spellcheck="false"
+          placeholder="API KEY" value="${escapeHtml(profile?.key ?? '')}" />
+        <input class="mExtra editTarget" type="text" readonly inputmode="none"
+          autocomplete="off" spellcheck="false"
+          placeholder='EXTRA PARAMS (optional JSON, e.g. {"thinking":{"type":"disabled"}} to disable thinking)'
+          value="${escapeHtml(profile?.extraParams ? JSON.stringify(profile.extraParams) : '')}" />
+        <input class="mEffort editTarget" type="text" readonly inputmode="none"
+          autocomplete="off" spellcheck="false"
+          placeholder="REASONING EFFORT (optional, e.g. low / high / max for GLM-5.3+)"
+          value="${escapeHtml(profile?.reasoningEffort ?? '')}" />
+      </div>
+    `
+  }
+
+  if (!models.length) {
+    rows.innerHTML = `<p class="empty">No models yet — add the one you want to translate with.</p>`
+  } else {
+    rows.innerHTML = models.map(m => modelCardHtml(m)).join('')
+  }
+
+  app.querySelector<HTMLButtonElement>('#settingsBack')!.addEventListener('click', () => renderSettings(app, callbacks))
+  app.querySelector<HTMLButtonElement>('#addModelBtn')!.addEventListener('click', () => {
+    rows.querySelector('.empty')?.remove()
+    rows.insertAdjacentHTML('beforeend', modelCardHtml(null))
+    // Focus the first input of the fresh card so typing can start right away.
+    rows.querySelector<HTMLInputElement>('.modelCard:last-child .mLabel')?.focus()
+  })
+  rows.addEventListener('click', event => {
+    if (!(event.target as HTMLElement).classList.contains('removeModel')) return
+    ;(event.target as HTMLElement).closest('.modelCard')?.remove()
+  })
+  rows.addEventListener('change', event => {
+    const select = event.target as HTMLSelectElement
+    if (!select.classList.contains('mPreset')) return
+    const preset = MODEL_PRESETS.find(p => p.key === select.value)
+    const card = select.closest<HTMLDivElement>('.modelCard')!
+    if (preset?.url) {
+      card.querySelector<HTMLInputElement>('.mLabel')!.value = preset.name
+      card.querySelector<HTMLInputElement>('.mUrl')!.value = preset.url
+    }
+    // Prefill the thinking-off param; Custom (no extra) leaves the box alone.
+    if (preset?.extra) {
+      card.querySelector<HTMLInputElement>('.mExtra')!.value = preset.extra
+    }
+    // Swap the suggestion list; the typed model ID itself is left untouched.
+    card.querySelector<HTMLDataListElement>('datalist')!.innerHTML = (preset?.ids ?? [])
+      .map(i => `<option value="${escapeHtml(i)}"></option>`)
+      .join('')
+  })
+
+  // iOS keyboards cover bottom-anchored inputs, so no field is ever focused
+  // in place: every editTarget is readonly + inputmode=none, and tapping one
+  // opens this sheet pinned to the TOP of the screen where the keyboard can't
+  // reach. OK (or the keyboard's done key) writes the value back.
+  const fieldNames: Record<string, string> = {
+    relayInput: 'Relay URL',
+    sonioxKeyInput: 'Soniox API Key',
+    mLabel: 'Name',
+    mModel: 'Model ID',
+    mUrl: 'URL',
+    mKey: 'API Key',
+    mExtra: 'Extra params (JSON)',
+    mEffort: 'Reasoning effort',
+  }
+
+  function openEditor(src: HTMLInputElement) {
+    app.querySelector('.editScrim')?.remove()
+    const label =
+      src.closest('.field')?.querySelector('h2')?.textContent ?? fieldNames[src.className.split(' ')[0]] ?? 'Edit'
+    const scrim = document.createElement('div')
+    scrim.className = 'editScrim'
+    scrim.innerHTML = `
+      <div class="editSheet">
+        <h2>${escapeHtml(label)}</h2>
+        <div class="editRow">
+          <input class="editInput" type="${src.type}" ${
+            src.inputMode === 'url' ? 'inputmode="url"' : src.inputMode === 'numeric' ? 'inputmode="numeric"' : ''
+          } enterkeyhint="done"
+            autocomplete="off" spellcheck="false"
+            ${src.getAttribute('list') ? `list="${escapeHtml(src.getAttribute('list')!)}"` : ''}
+            placeholder="${escapeHtml(src.placeholder)}" value="${escapeHtml(src.value)}" />
+          <button class="editCancel secondary settingsBtn">Cancel</button>
+          <button class="editOk settingsBtn">OK</button>
+        </div>
+      </div>
+    `
+    app.appendChild(scrim)
+    const editor = scrim.querySelector<HTMLInputElement>('.editInput')!
+    const commit = () => {
+      src.value = editor.value
+      scrim.remove()
+    }
+    scrim.querySelector<HTMLButtonElement>('.editOk')!.addEventListener('click', commit)
+    scrim.querySelector<HTMLButtonElement>('.editCancel')!.addEventListener('click', () => scrim.remove())
+    editor.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        commit()
+      }
+    })
+    // Focus synchronously: iOS only raises the keyboard for focus() calls
+    // inside the user-gesture handler — deferring it breaks that chain.
+    editor.focus()
+  }
+
+  app.querySelector('main')!.addEventListener('click', event => {
+    const target = event.target as HTMLElement
+    if (target instanceof HTMLInputElement && target.classList.contains('editTarget')) {
+      event.preventDefault()
+      openEditor(target)
+    }
+  })
+
+  app.querySelector<HTMLButtonElement>('#modalSave')!.addEventListener('click', () => {
+    const errorEl = app.querySelector<HTMLParagraphElement>('#modalError')!
+    const relay = withHttps(app.querySelector<HTMLInputElement>('#relayInput')!.value).replace(/\/+$/, '')
+    const sttKey = app.querySelector<HTMLInputElement>('#sonioxKeyInput')!.value.trim()
+
+    // History retention: blank falls back to the default; anything else must
+    // be a whole number ≥ 1.
+    const daysRaw = app.querySelector<HTMLInputElement>('#historyDaysInput')!.value.trim()
+    const countRaw = app.querySelector<HTMLInputElement>('#historyCountInput')!.value.trim()
+    const days = daysRaw === '' ? DEFAULT_HISTORY_RETENTION_DAYS : Number(daysRaw)
+    const count = countRaw === '' ? DEFAULT_HISTORY_MAX_RECORDS : Number(countRaw)
+    if (!Number.isInteger(days) || days < 1) {
+      errorEl.textContent = 'History days must be a whole number of 1 or more.'
+      return
+    }
+    if (!Number.isInteger(count) || count < 1) {
+      errorEl.textContent = 'History record cap must be a whole number of 1 or more.'
+      return
+    }
+
+    const next: ModelProfile[] = []
+    for (const card of [...rows.querySelectorAll<HTMLDivElement>('.modelCard')]) {
+      // Extra params are optional vendor-specific body params — parsed here so
+      // invalid JSON can't reach the relay.
+      const rawExtra = card.querySelector<HTMLInputElement>('.mExtra')!.value.trim()
+      let extraParams: Record<string, unknown> | undefined
+      if (rawExtra) {
+        try {
+          extraParams = JSON.parse(rawExtra) as Record<string, unknown>
+        } catch {
+          errorEl.textContent = `"${card.querySelector<HTMLInputElement>('.mLabel')!.value.trim() || 'New model'}": extra params are not valid JSON.`
+          return
+        }
+        if (!extraParams || typeof extraParams !== 'object' || Array.isArray(extraParams)) {
+          errorEl.textContent = 'Extra params must be a JSON object, e.g. {"thinking":{"type":"disabled"}}.'
+          return
+        }
+      }
+      const profile: ModelProfile = {
+        id: card.dataset.id || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        label: card.querySelector<HTMLInputElement>('.mLabel')!.value.trim(),
+        name: card.querySelector<HTMLInputElement>('.mModel')!.value.trim(),
+        url: withHttps(card.querySelector<HTMLInputElement>('.mUrl')!.value).replace(/\/+$/, ''),
+        key: card.querySelector<HTMLInputElement>('.mKey')!.value.trim(),
+        ...(extraParams ? { extraParams } : {}),
+        // Sent only when filled — blank means the param is left out entirely.
+        ...(card.querySelector<HTMLInputElement>('.mEffort')!.value.trim()
+          ? { reasoningEffort: card.querySelector<HTMLInputElement>('.mEffort')!.value.trim() }
+          : {}),
+      }
+      if (!profile.label && !profile.name && !profile.url && !profile.key) continue // blank card — drop
+      if (!profile.label || !profile.name || !profile.url || !profile.key) {
+        errorEl.textContent = 'Each model needs a name, model ID, URL, and key — fill it in or remove it.'
+        return
+      }
+      if (!isHttpUrl(profile.url)) {
+        errorEl.textContent = `"${profile.label}": the URL doesn't look like a valid http(s) address.`
+        return
+      }
+      next.push(profile)
+    }
+
+    if (relay && !isHttpUrl(relay)) {
+      errorEl.textContent = "The relay URL doesn't look like a valid http(s) address."
+      return
+    }
+
+    relayUrl = relay
+    sonioxKey = sttKey
+    models = next
+    historyRetentionDays = days
+    historyMaxRecords = count
+    if (!models.some(m => m.id === selectedModelId)) selectedModelId = models[0]?.id ?? ''
+
+    void saveUiConfig(fullConfig())
+    renderSettings(app, callbacks)
+  })
 }
 
 function formatTime(ts: number): string {
@@ -358,13 +908,23 @@ function injectStyles() {
       padding: 4px 8px; cursor: pointer; font-weight: 400; }
     .empty { font-size: 13px; color: #7B7B7B; padding: 8px 2px; }
 
-    .langsRow { display: flex; gap: 12px; align-items: stretch; }
-    .langCol { flex: 1 1 0; min-width: 0; }
-    .langArrow { align-self: center; color: #FEF991; font-size: 18px; }
-    .langList { max-height: 168px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
-    .lang { display: flex; align-items: center; gap: 8px; background: #1A1A1A;
-      border: 1px solid #2E2E2E; border-radius: 8px; padding: 8px 12px; font-size: 14px; }
-    .lang input { accent-color: #FEF991; width: 16px; height: 16px; flex: none; }
+    /* Language selection: compact bar + bottom-sheet picker. */
+    .langBar { display: block; width: 100%; background: #1A1A1A; border: 1px solid #2E2E2E;
+      border-radius: 12px; padding: 18px 16px; cursor: pointer; text-align: center; }
+    .langBarText { font-size: 26px; font-weight: 600; letter-spacing: 0.08em; color: #E5E5E5; }
+    .sheetScrim { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 15;
+      display: flex; align-items: flex-end; justify-content: center; }
+    .langSheet { width: 100%; max-width: 640px; background: #111111; border: 1px solid #2E2E2E;
+      border-bottom: none; border-radius: 16px 16px 0 0; padding: 20px; box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 14px; }
+    .langSheetHead { text-align: center; }
+    .sheetCols { display: flex; gap: 12px; }
+    .sheetCol { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; }
+    .chipList { overflow-y: auto; max-height: 38vh; display: flex; flex-direction: column; gap: 8px; }
+    .chip { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: #1A1A1A; color: #7B7B7B; border: 1px solid #2E2E2E; border-radius: 8px;
+      padding: 10px 12px; font-size: 14px; font-weight: 400; cursor: pointer; text-align: left; }
+    .chip.active { color: #E5E5E5; border-color: #FEF991; background: rgba(254,249,145,0.08); }
 
     .backBtn { padding: 8px 16px; }
     .detailTitle { flex: 1; min-width: 0; font-size: 15px; text-align: right; }
@@ -374,7 +934,44 @@ function injectStyles() {
       background: #1A1A1A; border: 1px solid #2E2E2E; border-radius: 12px; padding: 16px; }
     .mirrorText { margin: 0; font-size: 16px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; min-height: 24px; }
     .mirrorText.scrollable { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+    .debugLine { font-size: 11px; color: #7B7B7B; text-align: center; min-height: 14px; }
     footer { font-size: 12px; color: #7B7B7B; text-align: center; }
+
+    /* Model switching (Start + running screens). */
+    .settingsBtn { padding: 8px 14px; font-size: 13px; font-weight: 600; }
+    .modelRow { display: flex; flex-direction: column; }
+    .modelSelect { width: 100%; background: #1A1A1A; color: #E5E5E5; border: 1px solid #2E2E2E;
+      border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+    .modelSelect:disabled { color: #7B7B7B; }
+
+    /* Settings page — full screen like the record detail; body scrolls. */
+    .pageBody { flex: 1 1 0; min-height: 0; overflow-y: auto;
+      display: flex; flex-direction: column; gap: 12px; }
+    .field { display: flex; flex-direction: column; }
+    .field input, .modelCard input { background: rgba(255,255,255,0.08); color: #E5E5E5;
+      border: none; border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%;
+      box-sizing: border-box; }
+    .field input::placeholder, .modelCard input::placeholder { color: #7B7B7B; }
+    .fieldHeader { display: flex; align-items: center; justify-content: space-between; }
+    .modelRows { display: flex; flex-direction: column; gap: 8px; }
+    .modelCard { background: #1A1A1A; border: 1px solid #2E2E2E; border-radius: 8px;
+      padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .modelCardHead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .mPreset { flex: 1; background: rgba(255,255,255,0.08); color: #E5E5E5; border: none;
+      border-radius: 8px; padding: 8px 12px; font-size: 14px; font-weight: 600; }
+
+    /* Top-pinned edit sheet: keyboard rises against it instead of covering
+       the field being edited. 16px input font keeps iOS from zooming. */
+    .editScrim { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 20;
+      display: flex; justify-content: center; align-items: flex-start; }
+    .editSheet { width: 100%; max-width: 640px; background: #111111; border: 1px solid #2E2E2E;
+      border-top: none; border-radius: 0 0 16px 16px; padding: 16px 20px;
+      padding-top: calc(16px + env(safe-area-inset-top)); box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 10px; }
+    .editRow { display: flex; gap: 8px; }
+    .editInput { flex: 1; min-width: 0; background: rgba(255,255,255,0.08); color: #E5E5E5;
+      border: none; border-radius: 8px; padding: 10px 12px; font-size: 16px; }
+    .editInput::placeholder { color: #7B7B7B; font-size: 14px; }
   `
   const style = document.createElement('style')
   style.textContent = css

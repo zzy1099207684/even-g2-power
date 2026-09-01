@@ -7,6 +7,11 @@ import { TextContainerUpgrade, type EvenAppBridge } from '@evenrealities/even_hu
 
 const DEBOUNCE_MS = 120
 
+// A glasses write that never answers (host asleep, BLE wedged) must not stall
+// the shared queue forever: past this, the write is abandoned and the queue
+// moves on, so the display recovers on its own once the link comes back.
+const WRITE_TIMEOUT_MS = 3000
+
 export interface ContainerBox {
   innerWidth: number
   maxLines: number
@@ -65,6 +70,8 @@ export interface ContainerRenderer {
   schedule(rawText: string): void
   /** Update the geometry used by future schedule() calls. */
   setBox(box: ContainerBox): void
+  /** Forget the last written content so the next schedule() writes again. */
+  reset(): void
   /** Drop any pending debounced write (e.g. its container is about to go away). */
   cancel(): void
 }
@@ -86,16 +93,38 @@ export function createContainerRenderer(
     const content = fitTail(pendingText, box.innerWidth, box.maxLines) || ' '
     if (content === lastWritten) return
     lastWritten = content
-    queue.current = queue.current.then(async () => {
-      const result = await bridge.textContainerUpgrade(
-        new TextContainerUpgrade({ containerID, containerName, content }),
-      )
-      // Firmware rejects are otherwise invisible — a failed write leaves the
-      // glasses showing stale content while the phone looks fine.
-      if (typeof result === 'number' && result !== 0) {
-        console.warn(`textContainerUpgrade failed (${containerName}):`, result)
-      }
-    })
+    queue.current = queue.current
+      .then(async () => {
+        let timeoutId: ReturnType<typeof setTimeout> | undefined
+        const timeout = new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(
+            () => reject(new Error(`write timed out after ${WRITE_TIMEOUT_MS}ms`)),
+            WRITE_TIMEOUT_MS,
+          )
+        })
+        try {
+          const result = await Promise.race([
+            bridge.textContainerUpgrade(new TextContainerUpgrade({ containerID, containerName, content })),
+            timeout,
+          ])
+          // Firmware rejects are otherwise invisible — a failed write leaves the
+          // glasses showing stale content while the phone looks fine.
+          if (typeof result === 'number' && result !== 0) {
+            console.warn(`textContainerUpgrade failed (${containerName}):`, result)
+          }
+        } finally {
+          clearTimeout(timeoutId)
+        }
+      })
+      .catch(err => {
+        // A rejected write must not poison the shared queue chain — one flaky
+        // BLE/host error would otherwise kill every write that follows.
+        console.warn(`glasses write error (${containerName}):`, err)
+        // A write that died or timed out may never have reached the glasses —
+        // forget it so the next schedule() with the same content retries
+        // instead of being skipped as already-written.
+        if (lastWritten === content) lastWritten = null
+      })
   }
 
   return {
@@ -107,6 +136,9 @@ export function createContainerRenderer(
     setBox(newBox) {
       box = newBox
       lastWritten = null // force a rewrite against the new geometry
+    },
+    reset() {
+      lastWritten = null
     },
     cancel() {
       if (timer !== null) {
