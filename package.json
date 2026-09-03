@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "qr": "evenhub qr --url http://$(ip -4 addr show $(ip -4 route get 1.1.1.1 | grep -oP 'dev \\K\\S+' | head -1) | grep -oP 'inet \\K[\\d.]+' | head -1):${PORT:-5173}",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "pack": "npm run build && evenhub pack app.json dist",

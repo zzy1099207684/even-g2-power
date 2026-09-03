@@ -17,13 +17,29 @@ export interface TranslationSession {
 }
 
 // A hung request must not stall the queue forever — the watchdog aborts it,
-// the error is surfaced, and the next segment gets its turn.
-const REQUEST_TIMEOUT_MS = 10_000
+// the error is surfaced, and the next segment gets its turn. The watchdog is
+// an IDLE limit, not a total deadline: response headers and every streamed
+// chunk re-arm it, so a slow-but-alive stream finishes instead of being
+// killed mid-flight at an arbitrary wall-clock limit. Two phases: upstream
+// may legitimately think for a while before its first token, but once tokens
+// are flowing, a silence that long means the connection died.
+const FIRST_TOKEN_TIMEOUT_MS = 15_000
+const CHUNK_TIMEOUT_MS = 5_000
 // The phone's path to the relay is occasionally flaky (observed on device:
 // only the last queued segment ever translated). One retry keeps a transient
 // failure from silently losing a committed sentence forever.
 const MAX_ATTEMPTS = 2
 const RETRY_DELAY_MS = 800
+// A 429 means the provider's per-minute budget is briefly spent — the 800 ms
+// retry above just burns attempt two against a still-closed window (observed
+// on device: choppy speech sealed three fragments within seconds and every
+// request 429'd, so the fallback filled the translation lane with originals).
+// Rate-limited segments get their own short ladder (1s → 2s → 4s, then the
+// original-passthrough fallback in runTranslate): a translation minutes late
+// is worthless on live captions, so backing off longer than this would stall
+// the whole queue for text nobody is reading anymore.
+const RATE_LIMIT_ATTEMPTS = 4 // first try + 3 ladder retries
+const RATE_LIMIT_BACKOFF_MS = 1_000 // doubling per ladder step
 // Translations trail speech; when the model is persistently slower, the queue
 // would grow without bound and every translation would land minutes late —
 // long after its lines scrolled off the glasses. Past this many queued
@@ -79,10 +95,30 @@ export function createTranslationSession(
     }
   }
 
+  // One closure-wide gate: after ANY 429, the next request — this segment's
+  // ladder retry or the next queued segment's first try — waits here first.
+  // Choppy speech fires a request every few seconds; without this gap a fresh
+  // segment keeps re-tripping the same per-minute window.
+  let rateLimitHoldUntil = 0
+
   async function runTranslate(text: string) {
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      if (await attemptTranslate(text)) return
-      if (disposed || attempt >= MAX_ATTEMPTS) break
+    let failedAttempts = 0
+    let rateLimitAttempts = 0
+    for (;;) {
+      if (disposed) return
+      if (Date.now() < rateLimitHoldUntil)
+        await new Promise(resolve => setTimeout(resolve, rateLimitHoldUntil - Date.now()))
+      if (disposed) return
+      const result = await attemptTranslate(text)
+      if (result === 'done') return
+      if (result === 'rate-limited') {
+        rateLimitAttempts++
+        if (rateLimitAttempts >= RATE_LIMIT_ATTEMPTS) break
+        rateLimitHoldUntil = Date.now() + RATE_LIMIT_BACKOFF_MS * 2 ** (rateLimitAttempts - 1)
+        continue
+      }
+      failedAttempts++
+      if (disposed || failedAttempts >= MAX_ATTEMPTS) break
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
     }
     // Every attempt failed: pass the original through as its own translation.
@@ -91,21 +127,33 @@ export function createTranslationSession(
     if (!disposed) onCommit(text)
   }
 
-  /** Runs one request for the segment; true when it completed (or is hopeless). */
-  async function attemptTranslate(text: string): Promise<boolean> {
+  /**
+   * Runs one request for the segment. 'done': committed (or hopeless — no
+   * retry). 'rate-limited': 429, worth a delayed retry. 'failed': transient
+   * error, worth the fast retry.
+   */
+  async function attemptTranslate(text: string): Promise<'done' | 'failed' | 'rate-limited'> {
     const model = getModel?.()
     if (!model || !model.url || !model.name || !model.key) {
       onError?.(new Error('No model configured — add one in Settings'))
-      return true
+      return 'done'
     }
 
     const abort = new AbortController()
     current = abort
     let timedOut = false
-    const watchdog = setTimeout(() => {
-      timedOut = true
-      abort.abort()
-    }, REQUEST_TIMEOUT_MS)
+    let streamedAny = false
+    let watchdog: ReturnType<typeof setTimeout> | null = null
+    // Re-armed by every sign of progress; the phase decides how much silence
+    // is tolerated (see the constants above).
+    const armIdleWatchdog = () => {
+      if (watchdog !== null) clearTimeout(watchdog)
+      watchdog = setTimeout(() => {
+        timedOut = true
+        abort.abort()
+      }, streamedAny ? CHUNK_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_MS)
+    }
+    armIdleWatchdog()
 
     try {
       const res = await fetch(`${relayUrl}/translate`, {
@@ -114,7 +162,14 @@ export function createTranslationSession(
         body: JSON.stringify({ text, targetLang, context: getContext?.(), model }),
         signal: abort.signal,
       })
-      if (!res.ok || !res.body) throw new Error(`translate request failed: ${res.status}`)
+      armIdleWatchdog() // response headers arrived — the request is alive
+      if (!res.ok || !res.body) {
+        if (res.status === 429) {
+          onError?.(new Error('translate request failed: 429'))
+          return 'rate-limited'
+        }
+        throw new Error(`translate request failed: ${res.status}`)
+      }
 
       const reader = res.body.getReader()
       const decoder = new TextDecoder()
@@ -124,6 +179,8 @@ export function createTranslationSession(
       readLoop: for (;;) {
         const { done, value } = await reader.read()
         if (done) break
+        streamedAny = streamedAny || value.length > 0
+        armIdleWatchdog() // a chunk just arrived — the stream is alive
         buffer += decoder.decode(value, { stream: true })
 
         const lines = buffer.split('\n')
@@ -139,13 +196,16 @@ export function createTranslationSession(
       }
 
       onCommit(full)
-      return true
+      return 'done'
     } catch (err) {
-      if (timedOut) onError?.(new Error('translate request timed out'))
+      if (timedOut)
+        onError?.(
+          new Error(streamedAny ? 'translate stream stalled mid-way' : 'translate request timed out'),
+        )
       else if (!disposed && (err as Error)?.name !== 'AbortError') onError?.(err)
-      return false
+      return 'failed'
     } finally {
-      clearTimeout(watchdog)
+      if (watchdog !== null) clearTimeout(watchdog)
       if (current === abort) current = null
     }
   }

@@ -30,7 +30,7 @@ export interface Segmenter {
   addStable(text: string, langs: CharLangs): void
   /** The current revisable draft tail; replaces the previous value. */
   setLive(live: string, langs: CharLangs): void
-  /** Utterance ended: commit the never-confirmed remainder. */
+  /** Utterance ended: commit the never-confirmed remainder (short tails are held for the next utterance). */
   end(tail: string, langs: CharLangs): void
   /** The not-yet-committed workspace text — what the live line should show. */
   getPendingText(): string
@@ -257,19 +257,34 @@ export function createSegmenter(callbacks: {
         }
         lastEnd = i + 1
       }
-      // Whatever the clause scan left has no sentence break — it is the
-      // spoken tail fragment; peel it and commit it as-is.
+      // Whatever the clause scan left has no sentence break — the spoken tail
+      // fragment. Long enough to stand alone: peel and commit it as-is. Too
+      // short (same MIN_SENT_CHARS bar as drain): hold it in the workspace so
+      // it merges into the next utterance — choppy speech then costs one
+      // translation request per sentence instead of one per fragment. A held
+      // fragment stays visible as the live line; if no next utterance ever
+      // comes it never seals, which is acceptable for filler-length tails.
       const remainder = full.slice(lastEnd)
       if (remainder.trim()) {
         const peeled = peelRepeated(remainder)
-        if (peeled.text.trim()) {
+        if (peeled.text.trim().length >= MIN_SENT_CHARS) {
           markSealed(remainder)
           if (peeled.text !== remainder) markSealed(peeled.text)
           commitClause(peeled.text, lastEnd + peeled.cutFrom, allLangs)
+          stable = ''
+          stableLangs = []
+        } else {
+          // Keep the peeled form (not the raw remainder): the peel set has
+          // already claimed the repeated part, and re-holding it would echo
+          // committed text in the live line until the next drain peels it.
+          // cutFrom keeps text and langs aligned.
+          stable = peeled.text
+          stableLangs = allLangs.slice(lastEnd + peeled.cutFrom)
         }
+      } else {
+        stable = ''
+        stableLangs = []
       }
-      stable = ''
-      stableLangs = []
     },
 
     getPendingText() {

@@ -23,11 +23,15 @@
 //   The Langs arrays carry the per-character source language parallel to
 //   each part.
 //
-// Language identification is per token (`language` field). It stays truthful
-// only while `language_hints_strict` is off — strict mode relabels every token
-// with the hints — so strict stays off and filtering happens here instead:
-// tokens tagged with a language outside `languageHints` are dropped, so speech
-// in an unselected language never reaches the lanes. Tokens with no language
+// Language identification is per token (`language` field). Hints are bias
+// only — strict mode is off on purpose: speech in an unselected language comes
+// back transcribed in its own language and the filter below drops it, so the
+// display stays silent instead of forcing the words into a hinted language
+// (with `language_hints_strict` the model could only emit hinted languages, so
+// Chinese speech arrived as misheard English). The filter is now the only net:
+// tokens tagged with a language outside `languageHints` are dropped. Cost of
+// dropping strict: heavily accented speech in a hinted language is occasionally
+// mis-tagged to another language and lost the same way. Tokens with no language
 // (spaces, punctuation, markers) are kept.
 //
 // That per-token language also reaches the caller: the callbacks carry a
@@ -57,6 +61,8 @@ export interface StartSonioxStreamOptions {
   /** Fires once per `<end>`: the utterance's never-confirmed remainder. */
   onEnd(tail: string, langs: CharLangs): void
   onError?: (err: unknown) => void
+  /** Diagnostics: a token dropped by the language-hints filter (text, tagged language). */
+  onDrop?(text: string, lang: string): void
 }
 
 interface SonioxToken {
@@ -95,7 +101,6 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
           enable_endpoint_detection: true,
           max_endpoint_delay_ms: 1320,
           language_hints: opts.languageHints,
-          language_hints_strict: false,
         }),
       )
       resolve({
@@ -154,7 +159,10 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
         }
         // Structural stream opener — no text, never part of a transcript.
         if (token.text === '<docroot>') continue
-        if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) continue
+        if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) {
+          opts.onDrop?.(token.text ?? '', token.language)
+          continue
+        }
         const text = token.text ?? ''
         if (token.is_final) {
           delta += text
