@@ -9,8 +9,7 @@ const compiled = new Map()
 
 // Exercise main, transcript, history, config and the summary client together.
 // Only the device, speech provider, network and rendered UI are external boundaries.
-function appHarness() {
-  const storage = new Map()
+function appHarness(storage = new Map()) {
   const screens = []
   const requests = []
   const shutdowns = []
@@ -87,6 +86,7 @@ function appHarness() {
   })
   const modules = new Map()
   function load(filename) {
+    if (filename.endsWith('.json')) return JSON.parse(fs.readFileSync(filename, 'utf8'))
     if (modules.has(filename)) return modules.get(filename).exports
     if (!compiled.has(filename)) compiled.set(filename, ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
@@ -94,13 +94,15 @@ function appHarness() {
     const module = { exports: {} }
     modules.set(filename, module)
     const requireModule = name => Object.hasOwn(replacements, name)
-      ? replacements[name] : load(path.resolve(path.dirname(filename), `${name}.ts`))
+      ? replacements[name] : load(path.resolve(path.dirname(filename), name.endsWith('.json') ? name : `${name}.ts`))
     vm.runInContext(`(function(require,module,exports){${compiled.get(filename)}\n})`, context)(requireModule, module, module.exports)
     return module.exports
   }
   load(path.resolve(__dirname, '../src/main.ts'))
   return {
     screens, requests, shutdowns, microphone, storage, bridge, mirrors,
+    logs: () => load(path.resolve(__dirname, '../src/diagnostics.ts')).diagnostics.exportText(),
+    flushLogs: () => load(path.resolve(__dirname, '../src/diagnostics.ts')).diagnostics.flush(),
     start: enabled => callbacks.onStart(['en'], 'zh-Hans', 'Chinese (Simplified)', {
       relayUrl: 'https://relay.invalid', sonioxKey: 'test-only', model, screenClearSeconds: 15, summaryEnabled: enabled,
     }),
@@ -182,6 +184,14 @@ test('End saves original without a completed translation, waits for summary, the
   assert.equal(app.records()[0].summary, '周五开会. Alice 发送纪要.')
   assert.equal(app.screens.at(-1).home, true)
   assert.deepEqual(app.shutdowns, [])
+  await app.flushLogs()
+  const reopened = appHarness(app.storage)
+  await settle()
+  const logs = reopened.logs()
+  for (const event of ['session.end', 'history.saved', 'summary.request', 'summary.done', 'session.ended']) {
+    assert.ok(logs.includes(event), `Restored logs must include ${event}`)
+  }
+  for (const privateText of ['Friday meeting with Alice', '周五开会.', 'test-only']) assert.ok(!logs.includes(privateText))
 })
 
 test('End with summary disabled returns home without a model request and supports another session', async () => {

@@ -9,8 +9,8 @@ const code = ts.transpileModule(fs.readFileSync(path.resolve(__dirname, '../src/
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
 
-async function start() {
-  let socket
+async function start({ autoOpen = true } = {}) {
+  let socket, timeout
   class Socket {
     static OPEN = 1
     readyState = 0
@@ -19,22 +19,79 @@ async function start() {
     close() { this.readyState = 3 }
   }
   const loaded = { exports: {} }
-  vm.runInNewContext(`(function(module, exports) { ${code}\n})`, { WebSocket: Socket })(loaded, loaded.exports)
-  const stable = [], drafts = [], ends = [], drops = []
+  const diagnosticModule = { exports: {} }
+  const diagnosticCode = ts.transpileModule(fs.readFileSync(path.resolve(__dirname, '../src/diagnostics.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText
+  vm.runInNewContext(`(function(module,exports){${diagnosticCode}\n})`)(diagnosticModule, diagnosticModule.exports)
+  vm.runInNewContext(`(function(require, module, exports) { ${code}\n})`, {
+    WebSocket: Socket,
+    setTimeout: callback => { timeout = callback; return 1 },
+    clearTimeout: () => { timeout = null },
+  })(() => diagnosticModule.exports, loaded, loaded.exports)
+  const stable = [], drafts = [], ends = [], drops = [], errors = []
   const record = entries => (text, langs) => entries.push({ text, langs: Array.from(langs) })
   const opening = loaded.exports.startSonioxStream({
     apiKey: 'test-only', languageHints: ['en'],
     onStable: record(stable), onLive: record(drafts), onEnd: record(ends),
     onDrop: (text, reason) => drops.push({ text, reason }),
+    onError: error => errors.push(error),
   })
-  socket.readyState = Socket.OPEN
-  socket.onopen()
-  await opening
+  let client
+  if (autoOpen) {
+    socket.readyState = Socket.OPEN
+    socket.onopen()
+    client = await opening
+  }
   return {
-    stable, drafts, ends, drops,
+    stable, drafts, ends, drops, errors, socket, opening, client,
+    logs: () => diagnosticModule.exports.diagnostics.exportText(),
+    expire: () => timeout?.(),
     receive(tokens) { socket.onmessage({ data: JSON.stringify({ tokens }) }) },
   }
 }
+
+test('connection timeout rejects the pending handshake and reports one recoverable error', async () => {
+  const app = await start({ autoOpen: false })
+  app.expire()
+  assert.equal(app.socket.readyState, 3)
+  await assert.rejects(app.opening, /timed out/i)
+  assert.equal(app.errors.length, 1)
+  assert.equal(app.errors[0].retryable, true)
+})
+
+test('transport diagnostics distinguish sent audio, server replies and API errors without secrets', async () => {
+  const app = await start()
+  app.client.sendPcm(new Uint8Array(3200))
+  app.receive([{ text: 'private speech', language: 'en', is_final: true }])
+  app.socket.onmessage({ data: JSON.stringify({ error_type: 'request_timeout', error_code: 408, error_message: 'timeout', request_id: 'req-123' }) })
+  const text = app.logs()
+  assert.match(text, /stt.open/)
+  assert.match(text, /"stt.sentBytes":3200/)
+  assert.match(text, /"stt.responses":2/)
+  assert.match(text, /req-123/)
+  assert.ok(!text.includes('private speech'))
+  assert.ok(!text.includes('test-only'))
+})
+
+test('server errors retain retryability and are not reported again on close', async () => {
+  for (const [type, retryable] of [['REQUEST_TIMEOUT', true], ['service_unavailable', true], ['max_duration_reached', true], ['unauthenticated', false]]) {
+    const app = await start()
+    app.socket.onmessage({ data: JSON.stringify({ error_type: type, error_message: 'Test server error' }) })
+    app.socket.onclose?.({ code: 1000, reason: '' })
+    assert.equal(app.errors.length, 1)
+    assert.equal(app.errors[0].retryable, retryable)
+    assert.equal(app.socket.readyState, 3)
+  }
+})
+
+test('closing an opened client cancels timeout and suppresses later transport errors', async () => {
+  const app = await start()
+  app.client.close()
+  app.expire()
+  app.socket.onerror?.(new Error('late failure'))
+  app.socket.onclose?.({ code: 1006, reason: '' })
+  assert.equal(app.errors.length, 0)
+  assert.equal(app.socket.readyState, 3)
+})
 
 test('keeps an entire final word when its subwords have different confidence scores', async () => {
   const app = await start()

@@ -5,7 +5,7 @@ import {
   RebuildPageContainer,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
-import { startSonioxStream, type CharLangs, type SttClient } from './asr/stt'
+import { startSonioxStream, type CharLangs, type SttClient, type SttError } from './asr/stt'
 import { createTranslationSession, type TranslationSession } from './translate'
 import { createTranscript, type Transcript } from './transcript'
 import { createSegmenter, type Segmenter } from './segmenter'
@@ -20,6 +20,8 @@ import {
 } from './config'
 import { mountUi, getSelectedModel, type RunningUiHandle } from './ui'
 import { t } from './i18n'
+import { diagnostics } from './diagnostics'
+import { version as appVersion } from '../app.json'
 import { createWriteQueue, createContainerRenderer, fitTail, type ContainerBox, type ContainerRenderer } from './render'
 
 type DisplayMode = 'both' | 'translationOnly'
@@ -100,6 +102,29 @@ function translationContainerProps(mode: DisplayMode): TextContainerProperty {
 // on it — mountUi() renders right away, and handleStart() awaits this promise
 // only once the user has actually picked languages and tapped Start.
 const bridgePromise = waitForEvenAppBridge()
+diagnostics.log('app', 'boot', {
+  version: appVersion,
+  userAgent: typeof navigator === 'undefined' ? 'unavailable' : navigator.userAgent,
+})
+void bridgePromise.then(bridge => {
+  diagnostics.log('bridge', 'ready')
+  return diagnostics.attachStorage({
+    read: () => bridge.getLocalStorage('g2-translate-diagnostics'),
+    write: value => bridge.setLocalStorage('g2-translate-diagnostics', value),
+  })
+}).catch(err => diagnostics.error('bridge', 'error', err))
+window.addEventListener('error', event => diagnostics.error('app', 'uncaught', event.error ?? new Error(event.message)))
+window.addEventListener('unhandledrejection', event => diagnostics.error('app', 'unhandled_rejection', event.reason))
+for (const name of ['online', 'offline', 'pagehide', 'pageshow']) {
+  window.addEventListener(name, () => {
+    diagnostics.log('app', name)
+    if (name === 'pagehide') void diagnostics.flush()
+  })
+}
+if (typeof document !== 'undefined') document.addEventListener('visibilitychange', () => {
+  diagnostics.log('app', 'visibility', { state: document.visibilityState })
+  if (document.visibilityState === 'hidden') void diagnostics.flush()
+})
 
 // Set once handleStart resolves bridgePromise; toggleDisplayMode/cleanup/
 // pause/end run only after that (they're wired up at the end of a successful
@@ -181,25 +206,23 @@ if (dbgCfgRaw) {
             : DEFAULT_SCREEN_CLEAR_SECONDS,
       })
     } catch (err) {
-      console.error('dbgcfg failed:', err)
+      diagnostics.error('app', 'debug_config_failed', new Error((err as Error)?.name ?? 'Error'))
     }
   })()
 }
 
 async function startPcmFeeder(client: SttClient) {
-  console.log('dbgpcm: feeding', dbgPcmUrl)
+  diagnostics.log('mic', 'debug_feed_start')
   const res = await fetch(dbgPcmUrl!)
   const pcm = new Uint8Array(await res.arrayBuffer())
   for (let off = 0; off < pcm.length; off += 3200) {
     client.sendPcm(pcm.subarray(off, Math.min(off + 3200, pcm.length)))
     await new Promise(resolve => setTimeout(resolve, 100))
   }
-  console.log('dbgpcm: feed done', pcm.length, 'bytes')
+  diagnostics.log('mic', 'debug_feed_done', { bytes: pcm.length })
 }
 
-// TEMPORARY STT pipeline diagnostics — remove once the disappearing-text bug
-// is solved. Counters cover every hop: mic bytes out, token responses in,
-// `<end>` finals in, utterance commits, client errors.
+// High-frequency activity is sampled, rather than writing a log per frame.
 const dbg = {
   partials: 0,
   finals: 0,
@@ -209,37 +232,41 @@ const dbg = {
   bytes: 0,
   lastLen: 0,
   lastFinalLen: 0,
-  lastDrops: [] as string[],
   tSub: 0,
   tDone: 0,
   tPass: 0,
   tErr: 0,
   tLastErr: '',
-  lastCommits: [] as string[],
   rms: 0,
   noiseFloor: 0,
 }
 let dbgTimer: ReturnType<typeof setInterval> | null = null
+let lastMicAt = 0
 
 function renderDbg() {
-  const err = dbg.tLastErr ? ` lastTErr:${dbg.tLastErr.slice(0, 60)}` : ''
-  const last = dbg.lastCommits.length ? ` · L ${dbg.lastCommits.join(' | ')}` : ''
-  const drops = dbg.lastDrops.length ? ` · D ${dbg.lastDrops.join(' | ')}` : ''
-  runningUi?.setDebug(
-    `STT p:${dbg.partials} f:${dbg.finals} c:${dbg.commits} e:${dbg.errors} d:${dbg.dropped} · ` +
-      `TR sub:${dbg.tSub} done:${dbg.tDone} pass:${dbg.tPass} err:${dbg.tErr}${err}${last}${drops} · ` +
-      `rms:${Math.round(dbg.rms)} nf:${Math.round(dbg.noiseFloor)}`,
-  )
+  diagnostics.sample({
+    paused, connected: !!stt, idle: idleDisconnected, waking, retryBlocked: sttRetryBlocked,
+    retries: sttRetries, wakeRequested, wakeBufferBytes: wakePcmBytes,
+    micAgeMs: lastMicAt ? Date.now() - lastMicAt : null,
+    rms: Math.round(dbg.rms), noiseFloor: Math.round(dbg.noiseFloor),
+    stableResponses: dbg.partials, ends: dbg.finals, commits: dbg.commits, dropped: dbg.dropped,
+  })
 }
 
 // Opens the Soniox stream. Unselected-language tokens are dropped inside the
 // client (per-token language tags); stable/live/end increments reach here and
 // go straight into the segmenter, which commits each completed sentence
 // exactly once. Soniox kills idle sessions server-side (observed:
-// REQUEST_TIMEOUT after a long silence), so errors here trigger a bounded
-// auto-reconnect.
+// REQUEST_TIMEOUT after a long silence). Transient failures return to the
+// speech-wake path with backoff; silence never opens another paid stream.
 let sttRetries = 0
 let sttGen = 0
+let sttRetryBlocked = false
+let sttErrorText = '' // retain errors received before the running UI exists
+let sttIdleTimer: ReturnType<typeof setInterval> | null = null
+let lastSttAudioAt = 0
+const STT_RETRY_BASE_MS = 1500
+const STT_RETRY_MAX_MS = 6_000 // leave room for a handshake within the 10s PCM buffer
 
 // Idle disconnect: Soniox bills the full stream duration, so silence beyond
 // IDLE_DISCONNECT_AFTER_MS closes the socket. audioControl stays on — audio
@@ -307,6 +334,7 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
     apiKey: session.sonioxKey,
     languageHints: languages,
     onStable: (text, langs) => {
+      if (gen !== sttGen) return
       sttRetries = 0
       dbg.partials++
       dbg.lastLen = text.length
@@ -314,7 +342,8 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
       afterSpeechEvent(true)
     },
     onLive: (live, langs) => {
-      sttRetries = 0
+      if (gen !== sttGen) return
+      if (live.trim()) sttRetries = 0
       // A response with no stable delta and no draft carries nothing new —
       // skip it so the previous utterance's line stays on screen through a
       // pause instead of being blanked.
@@ -324,7 +353,8 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
       afterSpeechEvent(false) // live draft — never lights the dim screen
     },
     onEnd: (tail, langs) => {
-      sttRetries = 0
+      if (gen !== sttGen) return
+      if (tail.trim()) sttRetries = 0
       dbg.finals++
       dbg.lastFinalLen = tail.length
       segmenter?.end(tail, langs)
@@ -333,57 +363,43 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
       // the dim guard, leaving the marker hidden over an empty screen.
       afterSpeechEvent(tail.trim().length > 0)
     },
-    onDrop: (text, lang) => {
+    onDrop: () => {
+      if (gen !== sttGen) return
       dbg.dropped++
-      const trimmed = text.trim()
-      if (trimmed) {
-        dbg.lastDrops.push(`${trimmed.slice(0, 16)}(${lang})`)
-        if (dbg.lastDrops.length > 3) dbg.lastDrops.shift()
-      }
     },
-    onError: err => {
-      if (gen !== sttGen) return // a retired connection cannot reopen the current one
-      dbg.errors++
-      renderDbg()
-      runningUi?.setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
-      scheduleSttReopen()
-    },
+    onError: err => handleSttError(gen, err),
   })
   // A fresh socket restarts the idle clock — the silence check measures from
   // the moment the stream is live, not from the last session's last word.
-  lastSpeechAt = Date.now()
+  if (gen === sttGen) lastSpeechAt = lastSttAudioAt = Date.now()
   const sendPcm = client.sendPcm
   client.sendPcm = chunk => {
+    if (gen !== sttGen) return
+    lastSttAudioAt = Date.now()
     dbg.bytes += chunk.length
     sendPcm(chunk)
   }
   return client
 }
 
-// Reopens the stream after an error unless the session is gone. Three
-// consecutive failures without a recognized token in between give up (a bad
-// key would otherwise loop forever).
-function scheduleSttReopen() {
-  // Idle-disconnect state owns reopening (speech wakes it in wakeStt); a
-  // queued timer here must not fight it.
-  if (!activeSession || paused || cleanedUp || idleDisconnected) return
-  if (sttRetries >= 3) return
-  sttRetries++
-  const gen = ++sttGen
-  setTimeout(async () => {
-    if (gen !== sttGen || paused || cleanedUp || !activeSession || idleDisconnected) return
-    try {
-      stt?.close()
-    } catch {
-      // Socket already gone — reopening is all that matters.
-    }
-    try {
-      stt = await openStt(startLanguages, activeSession)
-      runningUi?.setStatus('listening', listeningStatusText())
-    } catch (err) {
-      runningUi?.setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
-    }
-  }, 1500)
+function handleSttError(gen: number, err: unknown) {
+  if (gen !== sttGen || !activeSession || paused || cleanedUp) return
+  sttGen++ // retire every callback from this failed connection
+  stt?.close()
+  stt = null
+  idleDisconnected = true
+  waking = false
+  wakeVerifyPending = false
+  sttRetryBlocked = (err as SttError | null)?.retryable === false
+  sttRetries = Math.min(sttRetries + 1, 6)
+  wakeSuppressUntil = Date.now() + Math.min(STT_RETRY_BASE_MS * 2 ** (sttRetries - 1), STT_RETRY_MAX_MS)
+  if (sttRetryBlocked) clearWakeBuffer()
+  diagnostics.log('stt', 'recovery_wait', { generation: gen, retryBlocked: sttRetryBlocked, retries: sttRetries,
+    retryInMs: wakeSuppressUntil - Date.now(), wakeBufferBytes: wakePcmBytes })
+  dbg.errors++
+  renderDbg()
+  sttErrorText = `STT error: ${(err as Error)?.message ?? err}`
+  runningUi?.setStatus('error', sttErrorText)
 }
 
 // Closes the STT socket while keeping the mic streaming — the audio-event
@@ -391,10 +407,28 @@ function scheduleSttReopen() {
 // display is untouched: the lanes just keep showing the last turn.
 function idleDisconnectStt() {
   if (!stt) return
+  diagnostics.log('stt', 'idle', { speechAgeMs: Date.now() - lastSpeechAt, audioAgeMs: Date.now() - lastSttAudioAt,
+    verifyingWake: wakeVerifyPending })
+  sttGen++
   stt.close()
   stt = null
   idleDisconnected = true
   runningUi?.setStatus('listening', t('Idle · mic listening, reopens on speech'))
+}
+
+// Run independently of PCM delivery: if the microphone stops producing
+// events, the paid stream still has to close before Soniox times it out.
+// Also run before routing a frame so a delayed timer cannot lose an onset.
+function checkSttIdle() {
+  if (!activeSession || paused || cleanedUp || !stt) return
+  const now = Date.now()
+  if (wakeVerifyPending && now - wakeConnectedAt >= IDLE_VERIFY_AFTER_MS) {
+    wakeVerifyPending = false
+    wakeSuppressUntil = now + IDLE_WAKE_SUPPRESS_MS
+    idleDisconnectStt()
+  } else if (now - lastSpeechAt >= IDLE_DISCONNECT_AFTER_MS || now - lastSttAudioAt >= IDLE_DISCONNECT_AFTER_MS) {
+    idleDisconnectStt()
+  }
 }
 
 // Root-mean-square of an s16le little-endian mono chunk.
@@ -416,6 +450,7 @@ function bufferWakePcm(pcm: Uint8Array, cap: number) {
   while (wakePcmBytes > cap) {
     const oldest = wakePcm.shift()!
     wakePcmBytes -= oldest.length
+    diagnostics.count('mic.bufferDroppedBytes', oldest.length)
   }
 }
 
@@ -429,9 +464,13 @@ function clearWakeBuffer() {
 // all following frames survive cooldown, retry throttling and the handshake
 // up to the buffer cap. Buffered room noise alone cannot trigger a wake.
 function onPcmWhileIdle(pcm: Uint8Array, rms: number) {
-  if (sttRetries >= 3) return // same give-up contract as scheduleSttReopen
+  if (paused || sttRetryBlocked) return
   const loud = rms > Math.max(noiseFloor * IDLE_WAKE_FACTOR, IDLE_WAKE_RMS_MIN)
-  if (loud) wakeRequested = true
+  if (loud && !wakeRequested) {
+    wakeRequested = true
+    diagnostics.log('stt', 'wake_requested', { rms: Math.round(rms), threshold: Math.round(Math.max(noiseFloor * IDLE_WAKE_FACTOR, IDLE_WAKE_RMS_MIN)),
+      retryInMs: Math.max(0, wakeSuppressUntil - Date.now()) })
+  }
   bufferWakePcm(pcm, wakeRequested ? IDLE_WAKE_PCM_CAP : IDLE_PRE_ROLL_PCM_CAP)
   if (!wakeRequested || Date.now() < wakeSuppressUntil) return
   if (!waking) void wakeStt()
@@ -439,10 +478,11 @@ function onPcmWhileIdle(pcm: Uint8Array, rms: number) {
 
 async function wakeStt() {
   if (!activeSession || paused || cleanedUp || !idleDisconnected || waking) return
-  if (Date.now() - lastWakeAttemptAt < 1500) return
+  if (Date.now() - lastWakeAttemptAt < STT_RETRY_BASE_MS) return
   lastWakeAttemptAt = Date.now()
   waking = true
   const gen = ++sttGen
+  diagnostics.log('stt', 'wake_connect', { generation: gen, wakeBufferBytes: wakePcmBytes })
   try {
     const client = await openStt(startLanguages, activeSession)
     if (gen !== sttGen || !activeSession || paused || cleanedUp) {
@@ -457,13 +497,15 @@ async function wakeStt() {
     // flowing for the same hold window as a loud frame on a connected stream.
     sendGateOpenUntil = wakeConnectedAt + SEND_GATE_HOLD_MS
     const buffered = wakePcm
+    diagnostics.log('stt', 'wake_ready', { generation: gen, replayBytes: wakePcmBytes })
     clearWakeBuffer()
     for (const chunk of buffered) client.sendPcm(chunk) // replay pre-handshake audio
+    sttErrorText = ''
     runningUi?.setStatus('listening', listeningStatusText())
-  } catch {
-    // Stay idle and retry the pending audio on later frames — no error flash for a
-    // transient handshake miss. sttRetries reaching 3 (checked on the frame
-    // path) ends the cycle, same contract as scheduleSttReopen.
+  } catch (err) {
+    // The transport normally reports first. The generation guard also covers
+    // a synchronous WebSocket construction failure without counting it twice.
+    handleSttError(gen, err)
   } finally {
     if (gen === sttGen) waking = false
   }
@@ -490,6 +532,18 @@ function wrapUiForStatusTracking(ui: RunningUiHandle): RunningUiHandle {
 
 async function handleStart(languages: string[], targetCode: string, targetLabel: string, session: SessionConfig) {
   if (ending || activeSession || cleanedUp) return
+  diagnostics.protect([session.sonioxKey, session.model.key])
+  diagnostics.log('session', 'start', { languages: languages.join(','), target: targetCode,
+    model: session.model.name, clearSeconds: session.screenClearSeconds, summaryEnabled: session.summaryEnabled === true })
+  // Reset before opening the socket: an API error can arrive while page
+  // creation is awaiting the device, and must survive the rest of startup.
+  paused = false
+  sttRetries = 0
+  sttRetryBlocked = false
+  sttErrorText = ''
+  lastWakeAttemptAt = 0
+  wakeSuppressUntil = 0
+  sendGateOpenUntil = 0
   startLanguages = languages
   startTargetCode = targetCode.split('-')[0] // 'zh-Hans' → 'zh' for the marker
   startTargetLang = targetLabel
@@ -501,6 +555,7 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   try {
     stt = await openStt(languages, session)
   } catch (err) {
+    diagnostics.error('session', 'start_failed', err)
     ui.showStartError((err as Error)?.message ?? t('Failed to start speech recognition'))
     return
   }
@@ -509,12 +564,14 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
 
   // Create once per app lifetime, then rebuild for each new session.
   // A page left by a WebView reload also needs the rebuild fallback.
+  diagnostics.log('glasses', 'layout_request', { mode: 'both', pageCreated })
   const created = pageCreated ? 1 : await bridge.createStartUpPageContainer(
     new CreateStartUpPageContainer({
       containerTotalNum: 3,
       textObject: [originalContainerProps(), translationContainerProps('both'), idleMarkerProps()],
     }),
   )
+  diagnostics.log('glasses', 'create_result', { result: created, skipped: pageCreated })
   if (created !== 0) {
     const rebuilt = await bridge.rebuildPageContainer(
       new RebuildPageContainer({
@@ -522,8 +579,9 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
         textObject: [originalContainerProps(), translationContainerProps('both'), idleMarkerProps()],
       }),
     )
+    diagnostics.log('glasses', 'rebuild_result', { result: rebuilt })
     if (!rebuilt) {
-      stt.close()
+      stt?.close()
       stt = null
       activeSession = null
       ui.showStartError(`createStartUpPageContainer failed: ${created}`)
@@ -533,28 +591,25 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   bridgeRef = bridge
   pageCreated = true
   displayMode = 'both'
-  paused = false
-  sttRetries = 0
-  lastWakeAttemptAt = 0
-  wakeSuppressUntil = 0
-  sendGateOpenUntil = 0
   activeRelayUrl = session.relayUrl
 
-  await bridge.audioControl(true)
+  await controlAudio(bridge, true)
 
   runningUi = wrapUiForStatusTracking(ui.showRunning())
+  if (sttErrorText) runningUi.setStatus('error', sttErrorText)
   transcript = createTranscript()
   // Cuts the ASR increments into sentences and hands each one out exactly
   // once; the commit callback routes it into the transcript + translation
   // pipeline below.
   segmenter = createSegmenter({
     commit: (text, langs) => {
-      recordCommit(text)
+      diagnostics.log('segment', 'commit', { chars: text.trim().length })
       commitSegment(text, langs)
     },
   })
   contextTail = ''
-  dbgTimer = setInterval(renderDbg, 500)
+  dbgTimer = setInterval(renderDbg, 5000)
+  sttIdleTimer = setInterval(checkSttIdle, 500)
   renderDbg()
 
   const queue = writeQueue
@@ -629,6 +684,14 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   if (!unsubscribe) unsubscribe = bridge.onEvenHubEvent(event => {
     const sysType = eventTypeOf(event.sysEvent)
     const textType = eventTypeOf(event.textEvent)
+    if (sysType !== null || textType !== null) diagnostics.log('glasses', 'event', { sysType, textType })
+    const pcm = event.audioEvent?.audioPcm
+    if (pcm) {
+      lastMicAt = Date.now()
+      diagnostics.count('mic.frames')
+      diagnostics.count('mic.bytes', pcm.length)
+      diagnostics.gauge('mic.lastFrameAt', lastMicAt)
+    }
     if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
       bridge.shutDownPageContainer(1)
       return
@@ -638,9 +701,8 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
       return
     }
     if (!activeSession || ending) return
-    const pcm = event.audioEvent?.audioPcm
-    if (pcm && !dbgPcmUrl) {
-      // Room-noise learning runs in every session state — only frames well
+    if (pcm && !paused && !dbgPcmUrl) {
+      // Room-noise learning stays active while listening — only frames well
       // below the floor update it, so speech never drags it up.
       const rms = pcmRms(pcm)
       dbg.rms = rms
@@ -650,22 +712,13 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
       // Retire an expired stream before routing this frame. The frame may
       // be a new speech onset, so it must enter the idle wake buffer rather
       // than be dropped or sent to a socket that is about to close.
-      if (stt) {
-        if (wakeVerifyPending && Date.now() - wakeConnectedAt >= IDLE_VERIFY_AFTER_MS) {
-          // Woken by noise: Soniox never recognized a token. Drop the socket
-          // and defer reconnecting during cooldown; keep buffering the mic.
-          wakeVerifyPending = false
-          wakeSuppressUntil = Date.now() + IDLE_WAKE_SUPPRESS_MS
-          idleDisconnectStt()
-        } else if (Date.now() - lastSpeechAt >= IDLE_DISCONNECT_AFTER_MS) {
-          idleDisconnectStt()
-        }
-      }
+      checkSttIdle()
       if (idleDisconnected) {
         onPcmWhileIdle(pcm, rms)
       } else if (stt) {
         if (rms > noiseFloor * SEND_GATE_FACTOR) sendGateOpenUntil = Date.now() + SEND_GATE_HOLD_MS
         if (Date.now() < sendGateOpenUntil) stt.sendPcm(pcm)
+        else diagnostics.count('mic.gatedFrames')
       }
     }
 
@@ -684,7 +737,7 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
     }
 
     if (sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT) {
-      toggleDisplayMode().catch(err => console.error('toggleDisplayMode failed:', err))
+      toggleDisplayMode().catch(err => diagnostics.error('glasses', 'layout_failed', err))
       return
     }
   })
@@ -899,15 +952,6 @@ function commitSegment(segment: string, langs: CharLangs): void {
   dbg.commits++
 }
 
-// TEMPORARY commit diagnostics — the recent-commit list on the phone's debug
-// line. Remove with the rest of the dbg block.
-function recordCommit(text: string): void {
-  const line = text.trim().slice(0, 30)
-  dbg.lastCommits.push(line)
-  if (dbg.lastCommits.length > 4) dbg.lastCommits.shift()
-  console.log('[commit]', line) // TEMPORARY diagnostics
-}
-
 // Prior committed originals — the sliding window sent as reference context on
 // every translate request, so the model can resolve pronouns and ellipsis
 // across segment cuts. Appended only AFTER a segment's submitFinal: requests
@@ -959,6 +1003,10 @@ async function checkTopicChange(prev: string, next: string): Promise<void> {
   const gen = sttGen
   const model = getSelectedModel()
   if (!activeRelayUrl || !model?.url || !model.name || !model.key) return
+  diagnostics.protect([model.key])
+  const id = diagnostics.count('topic.requests')
+  const startedAt = Date.now()
+  diagnostics.log('topic', 'request', { id, model: model.name, previousChars: prev.length, nextChars: next.length })
   const abort = new AbortController()
   const timer = setTimeout(() => abort.abort(), TOPIC_CHECK_TIMEOUT_MS)
   try {
@@ -968,17 +1016,23 @@ async function checkTopicChange(prev: string, next: string): Promise<void> {
       body: JSON.stringify({ prev, next, model }),
       signal: abort.signal,
     })
+    diagnostics.log('topic', 'response', { id, status: res.status, elapsedMs: Date.now() - startedAt })
     if (!res.ok) return
     const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
-    if (gen !== sttGen || !activeSession) return
+    if (gen !== sttGen || !activeSession) {
+      diagnostics.log('topic', 'stale', { id })
+      return
+    }
     const verdict = (data.choices?.[0]?.message?.content ?? '').trim().toLowerCase()
+    diagnostics.log('topic', 'done', { id, newTopic: verdict.includes('new'), elapsedMs: Date.now() - startedAt })
     if (!verdict.includes('new')) return // "same", or a garbled answer — keep the window
     const parts = contextTail.split('\n')
     const idx = parts.lastIndexOf(next)
     // idx <= 0: `next` is already the window head, or has been pushed out by
     // later segments — either way the old subject is already gone; nothing to do.
     if (idx > 0) contextTail = parts.slice(idx).join('\n')
-  } catch {
+  } catch (err) {
+    diagnostics.error('topic', 'error', err, { id, aborted: abort.signal.aborted, elapsedMs: Date.now() - startedAt })
     // Timeout or network failure: keep the window as-is.
   } finally {
     clearTimeout(timer)
@@ -988,6 +1042,7 @@ async function checkTopicChange(prev: string, next: string): Promise<void> {
 async function toggleDisplayMode() {
   if (!transcript) return
   const nextMode: DisplayMode = displayMode === 'both' ? 'translationOnly' : 'both'
+  diagnostics.log('glasses', 'layout_request', { mode: nextMode })
 
   if (nextMode === 'translationOnly') {
     translationRenderer?.setBox(FULL_BOX)
@@ -1003,7 +1058,7 @@ async function toggleDisplayMode() {
       }),
     )
     if (!ok) {
-      console.error('rebuildPageContainer failed switching to translationOnly')
+      diagnostics.error('glasses', 'layout_failed', new Error('rebuildPageContainer returned false'), { mode: nextMode })
       return
     }
     // The rebuild removed container 1 — a debounced original write left over
@@ -1024,12 +1079,13 @@ async function toggleDisplayMode() {
       }),
     )
     if (!ok) {
-      console.error('rebuildPageContainer failed switching to both')
+      diagnostics.error('glasses', 'layout_failed', new Error('rebuildPageContainer returned false'), { mode: nextMode })
       return
     }
   }
 
   displayMode = nextMode
+  diagnostics.log('glasses', 'layout_done', { mode: nextMode })
   // The rebuild recreated the marker container blank — forget the last
   // written text so the next tick repaints the strip.
   markerRenderer?.reset()
@@ -1041,9 +1097,10 @@ async function toggleDisplayMode() {
 
 function pauseSession() {
   if (paused) return
+  diagnostics.log('session', 'pause')
   paused = true
   sttGen++ // a pre-pause wake must not replace the manually resumed stream
-  bridgeRef?.audioControl(false)
+  if (bridgeRef) void controlAudio(bridgeRef, false).catch(() => {})
   // Soniox bills connection time, so pausing actually disconnects — silence
   // is never billed. The mid-utterance tail was never committed anyway; drop it.
   stt?.close()
@@ -1056,10 +1113,17 @@ function pauseSession() {
   clearWakeBuffer()
   runningUi?.setPaused(true)
   runningUi?.setStatus('listening', t('Paused · glasses frozen on the last turn'))
+  renderDbg()
+  void diagnostics.flush()
 }
 
 async function resumeSession() {
   if (!paused || !activeSession) return
+  diagnostics.log('session', 'resume')
+  sttRetries = 0
+  sttRetryBlocked = false
+  sttErrorText = ''
+  wakeSuppressUntil = 0
   const session = activeSession
   const gen = sttGen
   if (session) {
@@ -1079,9 +1143,22 @@ async function resumeSession() {
     wakeVerifyPending = false // manual resume — no noise adjudication needed
   }
   paused = false
-  bridgeRef?.audioControl(true)
+  if (bridgeRef) void controlAudio(bridgeRef, true).catch(() => {})
   runningUi?.setPaused(false)
   runningUi?.setStatus('listening', listeningStatusText())
+}
+
+async function controlAudio(bridge: Awaited<typeof bridgePromise>, enabled: boolean) {
+  const startedAt = Date.now()
+  diagnostics.log('mic', 'control_request', { enabled })
+  try {
+    const result = await bridge.audioControl(enabled)
+    diagnostics.log('mic', 'control_result', { enabled, result, elapsedMs: Date.now() - startedAt })
+    return result
+  } catch (err) {
+    diagnostics.error('mic', 'control_failed', err, { enabled, elapsedMs: Date.now() - startedAt })
+    throw err
+  }
 }
 
 // Closes the STT connection and translation session — shared by cleanup()
@@ -1091,7 +1168,11 @@ async function resumeSession() {
 // each sets it itself.
 function teardownSession() {
   activeSession = null
-  sttGen++ // invalidate any pending reconnect timer
+  sttGen++ // invalidate pending connection callbacks
+  if (sttIdleTimer !== null) {
+    clearInterval(sttIdleTimer)
+    sttIdleTimer = null
+  }
   if (markerTimer !== null) {
     clearInterval(markerTimer)
     markerTimer = null
@@ -1124,6 +1205,8 @@ function teardownSession() {
 // until the summary is saved (or fails), then return to the in-app home page.
 async function endSession() {
   if (ending || !activeSession) return
+  diagnostics.log('session', 'end')
+  renderDbg()
   ending = true
   const session = activeSession
   const model = getSelectedModel() ?? session.model
@@ -1140,14 +1223,16 @@ async function endSession() {
     // Drain already queued writes before blanking the retained glasses page.
     // It stays alive so a later Start can rebuild it without exiting the app.
     try {
-      await bridgeRef?.audioControl(false)
+      if (bridgeRef) await controlAudio(bridgeRef, false)
       await writeQueue.current
-      await bridgeRef?.rebuildPageContainer(new RebuildPageContainer({
+      diagnostics.log('glasses', 'clear_request')
+      const result = await bridgeRef?.rebuildPageContainer(new RebuildPageContainer({
         containerTotalNum: 3,
         textObject: [originalContainerProps(), translationContainerProps('both'), idleMarkerProps()],
       }))
+      diagnostics.log('glasses', 'clear_result', { result })
     } catch (err) {
-      console.warn('clearing glasses after End failed:', err)
+      diagnostics.error('glasses', 'clear_failed', err)
     }
     if (original || translation) {
       const record: SessionRecord = {
@@ -1165,7 +1250,7 @@ async function endSession() {
           const summary = await generateSummary(original, record.targetLang, session.relayUrl, model, summaryAbort.signal)
           if (!cleanedUp) await saveRecordSummary(record.id, summary)
         } catch (err) {
-          console.error('summary failed:', err)
+          diagnostics.error('session', 'summary_failed', err)
           message = t('Summary failed. Transcript saved; retry from History.')
         } finally {
           summaryAbort = null
@@ -1173,10 +1258,12 @@ async function endSession() {
       }
     }
   } catch (err) {
-    console.error('archiving session failed:', err)
+    diagnostics.error('session', 'archive_failed', err)
     message = t('Could not save this session.')
   } finally {
     ending = false
+    diagnostics.log('session', 'ended', { saveOrSummaryFailed: !!message })
+    void diagnostics.flush()
     if (!cleanedUp) ui.showHome(message)
   }
 }
@@ -1184,11 +1271,13 @@ async function endSession() {
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  diagnostics.log('app', 'cleanup')
   summaryAbort?.abort()
-  bridgeRef?.audioControl(false)
+  if (bridgeRef) void controlAudio(bridgeRef, false).catch(() => {})
   teardownSession()
   unsubscribe?.()
   unsubscribe = null
+  void diagnostics.flush()
 }
 
 window.addEventListener('beforeunload', cleanup)

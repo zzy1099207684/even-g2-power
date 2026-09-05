@@ -49,6 +49,8 @@
 // segment whether the speech is already in the target language and skip
 // translation for it.
 
+import { diagnostics } from '../diagnostics'
+
 /** Per-character source language, parallel to a callback's text. */
 export type CharLangs = (string | undefined)[]
 
@@ -87,6 +89,20 @@ export interface SttClient {
   close(): void
 }
 
+export class SttError extends Error {
+  constructor(message: string, readonly retryable = true) {
+    super(message)
+    this.name = 'SttError'
+  }
+}
+
+// Soniox returns a normal WebSocket close even for API errors. Use the
+// stable error_type from its JSON frame to decide whether speech can retry.
+const RETRYABLE_ERRORS = new Set([
+  'request_timeout', 'service_unavailable', 'internal_error',
+  'max_duration_reached', 'max_concurrent_streams_reached', 'limit_exceeded',
+])
+
 export interface StartSonioxStreamOptions {
   /** The user's own Soniox API key. */
   apiKey: string
@@ -116,9 +132,16 @@ interface SonioxMessage {
   finished?: boolean
   error_type?: string
   error_message?: string
+  error_code?: number
+  request_id?: string
 }
 
 export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise<SttClient> {
+  diagnostics.protect([opts.apiKey])
+  const connection = diagnostics.count('stt.connections')
+  const startedAt = Date.now()
+  let lastSentAt = 0
+  diagnostics.log('stt', 'connect', { connection, languages: opts.languageHints.join(','), model: 'stt-rt-v5' })
   const ws = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket')
   const allowed = new Set(opts.languageHints.map(code => code.toLowerCase()))
   // Script net's allow-set. Off unless every hint is a language the map
@@ -132,67 +155,105 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
   const sendPcm = (chunk: Uint8Array) => {
     // Frames arriving before the handshake completes are dropped — the mic
     // only comes up after the page is built anyway.
-    if (ws.readyState === WebSocket.OPEN) ws.send(chunk as Uint8Array<ArrayBuffer>)
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(chunk as Uint8Array<ArrayBuffer>)
+      lastSentAt = Date.now()
+      diagnostics.count('stt.sentFrames')
+      diagnostics.count('stt.sentBytes', chunk.length)
+      diagnostics.gauge('stt.bufferedBytes', ws.bufferedAmount ?? 0)
+      diagnostics.gauge('stt.lastSentAt', lastSentAt)
+    } else diagnostics.count('stt.unsentBytes', chunk.length)
   }
 
   return new Promise<SttClient>((resolve, reject) => {
-    ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          api_key: opts.apiKey,
-          model: 'stt-rt-v5',
-          audio_format: 'pcm_s16le',
-          num_channels: 1,
-          sample_rate: 16000,
-          enable_language_identification: true,
-          enable_endpoint_detection: true,
-          max_endpoint_delay_ms: 1320,
-          language_hints: opts.languageHints,
-        }),
-      )
-      resolve({
-        sendPcm,
-        // Billing counts connection time, so every exit path must actually
-        // kill the socket: empty frame ends the stream server-side, close(1000)
-        // tears the connection down immediately without waiting for the ack.
-        close() {
-          ws.onmessage = null
-          try {
-            if (ws.readyState === WebSocket.OPEN) ws.send('')
-          } catch {
-            // Socket already gone — closing is all that matters.
-          }
-          try {
-            ws.close(1000)
-          } catch {
-            // Same — a socket that never opened has nothing to close.
-          }
-        },
-      })
+    let stopped = false
+    const openTimer = setTimeout(() => fail(new SttError('Soniox WebSocket connection timed out')), 20_000)
+
+    // Billing counts connection time. Both local shutdown and failure must
+    // retire the socket immediately, including a handshake that never opens.
+    function close() {
+      if (stopped) return
+      diagnostics.log('stt', 'close_requested', { connection, readyState: ws.readyState, ageMs: Date.now() - startedAt })
+      stopped = true
+      clearTimeout(openTimer)
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send('')
+      } catch {
+        // Socket already gone — closing is all that matters.
+      }
+      try {
+        ws.close(1000)
+      } catch {
+        // The transport has already closed.
+      }
     }
 
-    ws.onerror = err => {
+    function fail(err: SttError, details: Record<string, unknown> = {}) {
+      if (stopped) return
+      diagnostics.error('stt', 'error', err, {
+        connection, retryable: err.retryable, readyState: ws.readyState,
+        lastSendAgeMs: lastSentAt ? Date.now() - lastSentAt : null, ...details,
+      })
+      close()
       reject(err)
       opts.onError?.(err)
     }
 
+    ws.onopen = () => {
+      if (stopped) return
+      clearTimeout(openTimer)
+      diagnostics.log('stt', 'open', { connection, elapsedMs: Date.now() - startedAt })
+      try {
+        ws.send(
+          JSON.stringify({
+            api_key: opts.apiKey,
+            model: 'stt-rt-v5',
+            audio_format: 'pcm_s16le',
+            num_channels: 1,
+            sample_rate: 16000,
+            enable_language_identification: true,
+            enable_endpoint_detection: true,
+            max_endpoint_delay_ms: 1320,
+            language_hints: opts.languageHints,
+          }),
+        )
+      } catch {
+        fail(new SttError('Soniox WebSocket configuration send failed'))
+        return
+      }
+      resolve({ sendPcm, close })
+    }
+
+    ws.onerror = () => fail(new SttError('Soniox WebSocket connection error'))
+
     ws.onclose = event => {
-      if (event.code !== 1000) opts.onError?.(new Error(`Soniox socket closed: ${event.code} ${event.reason}`))
+      diagnostics.log('stt', 'closed', { connection, code: event.code, reason: event.reason, wasClean: event.wasClean })
+      fail(new SttError(`Soniox socket closed: ${event.code} ${event.reason}`))
     }
 
     ws.onmessage = event => {
+      diagnostics.count('stt.responses')
+      diagnostics.gauge('stt.lastResponseAt', Date.now())
       let msg: SonioxMessage
       try {
         msg = JSON.parse(typeof event.data === 'string' ? event.data : '') as SonioxMessage
       } catch {
+        diagnostics.log('stt', 'invalid_response', { connection })
         return
       }
       if (msg.error_type) {
-        opts.onError?.(new Error(`Soniox: ${msg.error_type} — ${msg.error_message ?? 'unknown error'}`))
+        fail(new SttError(
+          `Soniox: ${msg.error_type} — ${msg.error_message ?? 'unknown error'}`,
+          RETRYABLE_ERRORS.has(msg.error_type.toLowerCase()),
+        ), { errorType: msg.error_type, errorCode: msg.error_code, requestId: msg.request_id })
         return
       }
       if (msg.finished) return // ack for our end-of-stream frame; socket is about to close
       if (!Array.isArray(msg.tokens)) return
+      diagnostics.count('stt.tokens', msg.tokens.length)
 
       let delta = ''
       let live = ''
@@ -211,10 +272,12 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
         // language tag: letters from a writing system no hinted language
         // uses cannot be this session's speech, however the token is labeled.
         if (scriptNetOn && TOKEN_SCRIPTS.some(([name, re]) => re.test(text) && !allowedScripts.has(name))) {
+          diagnostics.count('stt.droppedScript')
           opts.onDrop?.(text, 'script')
           continue
         }
         if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) {
+          diagnostics.count('stt.droppedLanguage')
           opts.onDrop?.(text, token.language)
           continue
         }

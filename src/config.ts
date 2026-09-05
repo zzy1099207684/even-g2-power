@@ -7,6 +7,7 @@
 // user; Start refuses to run until the required fields are filled.
 
 import { waitForEvenAppBridge } from '@evenrealities/even_hub_sdk'
+import { diagnostics } from './diagnostics'
 
 export interface ModelProfile {
   id: string
@@ -76,12 +77,18 @@ export async function loadUiConfig(): Promise<UiConfig | null> {
   try {
     const bridge = await waitForEvenAppBridge()
     const raw = await bridge.getLocalStorage(STORAGE_KEY)
-    if (!raw) return null
+    if (!raw) {
+      diagnostics.log('config', 'loaded', { present: false })
+      return null
+    }
     const parsed = JSON.parse(raw) as Partial<UiConfig>
-    if (!Array.isArray(parsed.sources) || typeof parsed.target !== 'string') return null
+    if (!Array.isArray(parsed.sources) || typeof parsed.target !== 'string') {
+      diagnostics.log('config', 'invalid')
+      return null
+    }
     // Missing service fields default to empty so the stored language selection
     // still applies and Settings asks for the rest.
-    return {
+    const config: UiConfig = {
       sources: parsed.sources,
       target: parsed.target,
       relayUrl: typeof parsed.relayUrl === 'string' ? parsed.relayUrl : '',
@@ -119,16 +126,24 @@ export async function loadUiConfig(): Promise<UiConfig | null> {
       uiLang: parsed.uiLang === 'zh' ? 'zh' : 'en',
       summaryEnabled: parsed.summaryEnabled === true,
     }
-  } catch {
+    diagnostics.protect([config.sonioxKey, ...config.models.map(model => model.key)])
+    diagnostics.log('config', 'loaded', { present: true, models: config.models.length, uiLang: config.uiLang })
+    return config
+  } catch (err) {
+    diagnostics.error('config', 'load_failed', err)
     return null // no saved config yet, or storage unavailable — defaults apply
   }
 }
 
 export async function saveUiConfig(config: UiConfig): Promise<void> {
+  diagnostics.protect([config.sonioxKey, ...config.models.map(model => model.key)])
+  diagnostics.log('config', 'save_request', { models: config.models.length, uiLang: config.uiLang })
   try {
     const bridge = await waitForEvenAppBridge()
-    await bridge.setLocalStorage(STORAGE_KEY, JSON.stringify(config))
-  } catch {
+    if (!await bridge.setLocalStorage(STORAGE_KEY, JSON.stringify(config))) throw new Error('Config storage returned false')
+    diagnostics.log('config', 'saved')
+  } catch (err) {
+    diagnostics.error('config', 'save_failed', err)
     // Best-effort: worst case the next open falls back to the built-in defaults.
   }
 }

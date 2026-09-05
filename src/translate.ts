@@ -3,6 +3,7 @@
 // commit in order, including same-language passthrough and error fallbacks.
 
 import type { ModelProfile } from './config'
+import { diagnostics } from './diagnostics'
 
 export interface TranslationSession {
   /** Passthrough skips the model but keeps the sentence in display order. */
@@ -24,6 +25,7 @@ const RATE_LIMIT_ATTEMPTS = 4
 const RATE_LIMIT_BACKOFF_MS = 1_000
 
 interface QueuedSegment {
+  id: number
   text: string
   context: string | undefined
   passthrough: boolean
@@ -125,17 +127,28 @@ export function createTranslationSession(
       entry.state = entry.failedAttempts >= MAX_ATTEMPTS ? 'done' : 'queued'
       entry.retryAt = Date.now() + RETRY_DELAY_MS
     }
+    if (result.status !== 'done') diagnostics.log('translation', entry.state === 'queued' ? 'retry' : 'fallback', {
+      id: entry.id, reason: result.status, failedAttempts: entry.failedAttempts,
+      rateLimitAttempts: entry.rateLimitAttempts, retryInMs: Math.max(0, Math.max(entry.retryAt, rateLimitHoldUntil) - Date.now()),
+    })
     // result starts as the original, preserving FIFO pairing if all
     // attempts fail. Clearing a failed draft never archives a half sentence.
     pump()
   }
 
   async function attemptTranslate(entry: QueuedSegment): Promise<AttemptResult> {
+    const startedAt = Date.now()
     const model = getModel?.()
     if (!model || !model.url || !model.name || !model.key) {
+      diagnostics.log('translation', 'fallback', { id: entry.id, reason: 'no_model' })
       onError?.(new Error('No model configured — add one in Settings'))
       return { status: 'done', text: entry.text }
     }
+    diagnostics.protect([model.key])
+    diagnostics.log('translation', 'request', {
+      id: entry.id, attempt: entry.failedAttempts + entry.rateLimitAttempts + 1, model: model.name,
+      inputChars: entry.text.length, contextChars: entry.context?.length ?? 0, queued: queue.length, active,
+    })
 
     const abort = new AbortController()
     controllers.add(abort)
@@ -159,6 +172,7 @@ export function createTranslationSession(
         body: JSON.stringify({ text: entry.text, targetLang, context: entry.context, model }),
         signal: abort.signal,
       })
+      diagnostics.log('translation', 'response', { id: entry.id, status: res.status, elapsedMs: Date.now() - startedAt })
       armIdleWatchdog()
       if (!res.ok || !res.body) {
         void res.body?.cancel().catch(() => {})
@@ -179,6 +193,7 @@ export function createTranslationSession(
         const { done, value } = await reader.read()
         if (disposed) return { status: 'failed' }
         if (done) break
+        if (!streamedAny && value.length) diagnostics.log('translation', 'first_chunk', { id: entry.id, elapsedMs: Date.now() - startedAt })
         streamedAny = streamedAny || value.length > 0
         armIdleWatchdog()
         buffer += decoder.decode(value, { stream: true })
@@ -197,8 +212,12 @@ export function createTranslationSession(
         entry.draft = full
         publish()
       }
+      diagnostics.log('translation', 'done', { id: entry.id, outputChars: full.length, fallback: !full, elapsedMs: Date.now() - startedAt })
       return { status: 'done', text: full || entry.text }
     } catch (err) {
+      // JSON parser messages can quote response text. Keep only their category.
+      diagnostics.error('translation', 'error', (err as Error)?.name === 'SyntaxError' ? new Error('Invalid translation response JSON') : err,
+        { id: entry.id, timedOut, cancelled: disposed, streamedAny, elapsedMs: Date.now() - startedAt })
       if (!disposed) {
         if (timedOut) onError?.(new Error(streamedAny ? 'translate stream stalled mid-way' : 'translate request timed out'))
         else if ((err as Error)?.name !== 'AbortError') onError?.(err)
@@ -226,10 +245,13 @@ export function createTranslationSession(
       if (!text || disposed) return
       if (!passthrough && queue.filter(entry => entry.state === 'queued').length >= MAX_PENDING) {
         const victim = queue.find(entry => entry.state === 'queued')!
+        diagnostics.log('translation', 'fallback', { id: victim.id, reason: 'queue_full' })
         victim.state = 'done'
       }
+      const id = diagnostics.count('translation.segments')
+      diagnostics.log('translation', 'submit', { id, inputChars: text.length, passthrough })
       queue.push({
-        text, context: getContext?.(), passthrough,
+        id, text, context: getContext?.(), passthrough,
         state: passthrough ? 'done' : 'queued', draft: '', result: text,
         failedAttempts: 0, rateLimitAttempts: 0, retryAt: 0,
       })
@@ -237,6 +259,7 @@ export function createTranslationSession(
     },
     finish() {
       if (disposed) return
+      diagnostics.log('translation', 'finish', { pending: queue.length, active })
       // End must preserve completed previews even if an earlier request is
       // still running. Stop first so late responses cannot append them twice.
       stopRequests()
@@ -247,6 +270,7 @@ export function createTranslationSession(
       onPartial?.('')
     },
     dispose() {
+      if (!disposed) diagnostics.log('translation', 'dispose', { pending: queue.length, active })
       stopRequests()
       queue.length = 0
     },

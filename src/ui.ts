@@ -16,6 +16,7 @@ import {
   type UiConfig,
 } from './config'
 import { getUiLang, setUiLang, t, tf } from './i18n'
+import { diagnostics } from './diagnostics'
 
 // Bound to Soniox stt-rt-v5 (60+ languages with per-token language
 // identification, including Chinese). `label` is the English display name (also the archived-record
@@ -86,8 +87,6 @@ export interface RunningUiHandle {
   /** Sealed translation lines plus the currently streaming sentence. */
   setTranslationMirror(sealed: readonly string[], current: string): void
   setPaused(paused: boolean): void
-  /** TEMPORARY: STT pipeline diagnostics, remove after debugging. */
-  setDebug(text: string): void
 }
 
 export interface UiHandle {
@@ -249,9 +248,102 @@ function wireModelSelect(app: HTMLDivElement, idAttr: string) {
 
 let stylesInjected = false
 
+function recordPage(page: string) {
+  diagnostics.log('ui', 'page', { page })
+  // Keep the shared button and its listener alive while #app is replaced.
+  const dock = document.querySelector<HTMLElement>('#diagnosticsDock')
+  const button = document.querySelector('#diagnosticsBtn')
+  if (dock && button) {
+    button.textContent = t('Diagnostics')
+    dock.appendChild(button)
+    dock.hidden = false
+  }
+}
+
+function placeDiagnostics() {
+  const slot = document.querySelector('#diagnosticsSlot')
+  const button = document.querySelector('#diagnosticsBtn')
+  if (!slot || !button) return
+  slot.appendChild(button)
+  document.querySelector<HTMLElement>('#diagnosticsDock')!.hidden = true
+}
+
+// The dock retains the entry on pages without an inline position.
+function mountDiagnostics(app: HTMLDivElement) {
+  if (document.querySelector('#diagnosticsDock')) return
+  const dock = document.createElement('div')
+  dock.id = 'diagnosticsDock'
+  dock.innerHTML = `<button id="diagnosticsBtn" class="secondary settingsBtn" type="button">${t('Diagnostics')}</button>`
+  document.body.appendChild(dock)
+  document.addEventListener('click', event => {
+    const control = (event.target as Element | null)?.closest('button, input, select, .recordMain')
+    if (control) diagnostics.log('ui', 'click', { control: control.id || control.className })
+  }, true)
+  document.addEventListener('change', event => {
+    const control = event.target as HTMLElement
+    diagnostics.log('ui', 'change', { control: control.id || control.className })
+  }, true)
+  dock.querySelector('button')!.addEventListener('click', () => {
+    diagnostics.log('diagnostics', 'opened')
+    const scrim = document.createElement('div')
+    scrim.className = 'sheetScrim'
+    scrim.innerHTML = `
+      <section class="langSheet diagnosticsSheet" role="dialog" aria-modal="true" aria-labelledby="diagnosticsTitle">
+        <h2 id="diagnosticsTitle">${t('Diagnostics')}</h2>
+        <p class="hint">${t('Recent app activity. No keys, audio or conversation text.')}</p>
+        <textarea id="diagnosticsText" readonly spellcheck="false" aria-label="${t('Diagnostics')}"></textarea>
+        <p id="diagnosticsFeedback" class="hint" role="status" aria-live="polite"></p>
+        <div class="controls">
+          <button id="copyDiagnostics" type="button">${t('Copy all logs')}</button>
+          <button id="closeDiagnostics" class="secondary" type="button">${t('Close')}</button>
+        </div>
+      </section>`
+    document.body.appendChild(scrim)
+    const field = scrim.querySelector<HTMLTextAreaElement>('#diagnosticsText')!
+    const copy = scrim.querySelector<HTMLButtonElement>('#copyDiagnostics')!
+    const close = scrim.querySelector<HTMLButtonElement>('#closeDiagnostics')!
+    const feedback = scrim.querySelector<HTMLElement>('#diagnosticsFeedback')!
+    const focused = document.activeElement as HTMLElement | null
+    app.inert = dock.inert = true
+    field.value = diagnostics.exportText()
+    copy.focus()
+    const dismiss = () => {
+      scrim.remove()
+      app.inert = dock.inert = false
+      focused?.focus({ preventScroll: true })
+    }
+    close.addEventListener('click', dismiss)
+    scrim.addEventListener('click', event => { if (event.target === scrim) dismiss() })
+    scrim.addEventListener('keydown', event => {
+      if (event.key === 'Escape') dismiss()
+      if (event.key === 'Tab') {
+        if (event.shiftKey && document.activeElement === field) { event.preventDefault(); close.focus() }
+        else if (!event.shiftKey && document.activeElement === close) { event.preventDefault(); field.focus() }
+      }
+    })
+    copy.addEventListener('click', async () => {
+      diagnostics.log('diagnostics', 'copy_requested')
+      field.value = diagnostics.exportText()
+      try {
+        await copyText(field.value)
+        feedback.textContent = t('Copied')
+        diagnostics.log('diagnostics', 'copied', { chars: field.value.length })
+      } catch (err) {
+        diagnostics.error('diagnostics', 'copy_failed', err)
+        feedback.textContent = t('Select all below and copy manually.')
+        field.focus()
+        field.select()
+        field.setSelectionRange(0, field.value.length)
+      }
+      void diagnostics.flush()
+    })
+  })
+}
+
 export function mountUi(callbacks: UiCallbacks): UiHandle {
   const app = document.querySelector<HTMLDivElement>('#app')!
   injectStyles()
+  mountDiagnostics(app)
   renderSettings(app, callbacks)
 
   return {
@@ -260,6 +352,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       app.querySelector<HTMLElement>('#settingsError')!.textContent = message
     },
     showEnding(summarizing) {
+      recordPage(summarizing ? 'summarizing' : 'saving')
       app.innerHTML = `
         <main class="panel">
           <header><h1>G2 Translate</h1></header>
@@ -272,6 +365,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       `
     },
     showConnecting() {
+      recordPage('connecting')
       app.innerHTML = `
         <main class="panel">
           <div class="status status-connecting">${t('Connecting…')}</div>
@@ -279,11 +373,13 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       `
     },
     showStartError(message) {
+      diagnostics.error('ui', 'start_error', new Error(message))
       renderSettings(app, callbacks)
       const err = app.querySelector<HTMLParagraphElement>('#settingsError')
       if (err) err.textContent = message
     },
     applyConfig(config) {
+      diagnostics.protect([config.sonioxKey, ...config.models.filter(isProfile).map(model => model.key)])
       // UI language first — everything re-rendered below picks it up.
       if (config.uiLang === 'zh' || config.uiLang === 'en') setUiLang(config.uiLang)
       // Stored codes can go stale if the language lists change — keep only
@@ -313,6 +409,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       if (app.querySelector('#startBtn')) renderSettings(app, callbacks)
     },
     showRunning() {
+      recordPage('running')
       app.innerHTML = `
         <main class="panel">
           <header>
@@ -329,22 +426,24 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
           </section>
           <div class="modelRow">
             <h2>${t('Model')}</h2>
-            ${modelSelectHtml('runModelSelect')}
+            <div class="modelControls">
+              ${modelSelectHtml('runModelSelect')}
+              <span id="diagnosticsSlot"></span>
+            </div>
           </div>
           <div class="controls">
             <button id="pauseBtn" class="secondary">${t('Pause')}</button>
             <button id="endBtn" class="secondary">${t('End')}</button>
           </div>
-          <div id="debugLine" class="debugLine"></div>
           <footer>${t('Tap glasses: toggle layout · swipe: browse history · double-tap: exit')}</footer>
         </main>
       `
+      placeDiagnostics()
       const statusEl = app.querySelector<HTMLDivElement>('#status')!
       const originalEl = app.querySelector<HTMLDivElement>('#originalMirror')!
       const translationEl = app.querySelector<HTMLDivElement>('#translationMirror')!
       const pauseBtn = app.querySelector<HTMLButtonElement>('#pauseBtn')!
       const endBtn = app.querySelector<HTMLButtonElement>('#endBtn')!
-      const debugEl = app.querySelector<HTMLDivElement>('#debugLine')!
       wireModelSelect(app, 'runModelSelect')
       wireMirrorCopy(app)
 
@@ -411,9 +510,6 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
           paused = next
           pauseBtn.textContent = paused ? t('Resume') : t('Pause')
         },
-        setDebug(text) {
-          debugEl.textContent = text
-        },
       }
     },
   }
@@ -422,11 +518,13 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
 // Settings screen, top to bottom: session history (newest first), the
 // compact language bar (opens the bottom-sheet picker), model select, Start.
 function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
+  recordPage('home')
   app.innerHTML = `
     <main class="panel">
-      <header>
+      <header class="homeHeader">
         <h1>G2 Translate</h1>
         <div class="headerBtns">
+          <span id="diagnosticsSlot"></span>
           <button id="langToggle" class="secondary settingsBtn">${getUiLang() === 'zh' ? 'EN' : '中文'}</button>
           <button id="settingsBtn" class="secondary settingsBtn">${t('Settings')}</button>
         </div>
@@ -447,6 +545,7 @@ function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
     </main>
   `
 
+  placeDiagnostics()
   app.querySelector<HTMLButtonElement>('#langToggle')!.addEventListener('click', () => {
     setUiLang(getUiLang() === 'zh' ? 'en' : 'zh')
     void saveUiConfig(fullConfig())
@@ -586,11 +685,15 @@ function renderLangSheet(app: HTMLDivElement, callbacks: UiCallbacks) {
 // half-filled ones block the save so a typo can't silently produce a broken
 // profile. Back leaves without saving.
 function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
+  recordPage('settings')
   app.innerHTML = `
     <main class="panel">
       <header>
         <button id="settingsBack" class="secondary backBtn">${t('Back')}</button>
-        <h1 class="detailTitle">${t('Settings')}</h1>
+        <div class="headerBtns">
+          <span id="diagnosticsSlot"></span>
+          <h1 class="detailTitle">${t('Settings')}</h1>
+        </div>
       </header>
       <div class="pageBody">
         <label class="field">
@@ -645,6 +748,7 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
     </main>
   `
 
+  placeDiagnostics()
   const rows = app.querySelector<HTMLDivElement>('#modelRows')!
 
   // A preset select sits at the top of each card; picking one fills
@@ -913,8 +1017,10 @@ function recordItemHtml(r: SessionRecord): string {
 
 // Full text of one saved session; Back returns to the settings screen.
 async function renderRecordDetail(app: HTMLDivElement, callbacks: UiCallbacks, id: string) {
+  diagnostics.log('ui', 'history_open', { id })
   const record = await getRecord(id)
   if (!record) return
+  recordPage('history_detail')
   app.innerHTML = `
     <main class="panel">
       <header>
@@ -1058,8 +1164,10 @@ function wireMirrorCopy(app: HTMLDivElement): void {
         button.disabled = true
         try {
           await copyText(content)
+          diagnostics.log('ui', 'text_copied', { panel: text.id, chars: content.length })
           feedback.textContent = t('Copied')
-        } catch {
+        } catch (err) {
+          diagnostics.error('ui', 'copy_failed', err, { panel: text.id })
           feedback.textContent = t('Copy failed. Try again.')
         } finally {
           button.disabled = false
@@ -1126,7 +1234,18 @@ function injectStyles() {
       font: 16px/1.4 -apple-system, BlinkMacSystemFont, 'Helvetica Neue', system-ui, sans-serif;
       touch-action: manipulation; -webkit-text-size-adjust: 100%;
       overscroll-behavior: none; }
-    #app { display: flex; height: 100%; }
+    body { display: flex; flex-direction: column; }
+    #app { display: flex; flex: 1; min-height: 0; }
+    #diagnosticsDock { flex-shrink: 0; text-align: center; padding: 0 24px max(8px, env(safe-area-inset-bottom)); }
+    #diagnosticsBtn { min-height: 44px; white-space: nowrap; }
+    #diagnosticsDock #diagnosticsBtn { min-width: 120px; }
+    #diagnosticsSlot { display: flex; flex-shrink: 0; }
+    .diagnosticsSheet { height: 78%; max-height: 100%; padding-bottom: max(20px, env(safe-area-inset-bottom)); }
+    #diagnosticsTitle { margin: 0; }
+    #diagnosticsText { flex: 1; min-height: 0; width: 100%; box-sizing: border-box; resize: none;
+      background: #1A1A1A; color: #E5E5E5; border: 1px solid #2E2E2E; border-radius: 8px;
+      padding: 12px; font: 16px/1.4 monospace; }
+    #diagnosticsFeedback { min-height: 20px; }
     .panel { display: flex; flex-direction: column; gap: 16px; height: 100%;
       width: 100%; max-width: 640px; margin: 0 auto; padding: 24px; box-sizing: border-box; }
     header { display: flex; align-items: center; justify-content: space-between; }
@@ -1227,13 +1346,17 @@ function injectStyles() {
     .isGenerating::before { content: ''; width: 12px; height: 12px; margin-right: 8px; vertical-align: middle; }
     @keyframes summarySpin { to { transform: rotate(360deg); } }
     @media (prefers-reduced-motion: reduce) { .summarySpinner, .isGenerating::before { animation: none; } }
-    .debugLine { font-size: 11px; color: #7B7B7B; text-align: center; min-height: 14px; }
     footer { font-size: 12px; color: #7B7B7B; text-align: center; }
 
     /* Model switching (Start + running screens). */
     .settingsBtn { padding: 8px 14px; font-size: 13px; font-weight: 600; }
-    .headerBtns { display: flex; gap: 8px; }
+    .headerBtns { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .homeHeader { flex-wrap: wrap; gap: 8px; }
+    .homeHeader h1 { white-space: nowrap; }
+    .homeHeader .headerBtns { margin-left: auto; }
     .modelRow { display: flex; flex-direction: column; }
+    .modelControls { display: flex; gap: 12px; }
+    .modelControls .modelSelect { flex: 1; min-width: 0; }
     .modelSelect { width: 100%; background: #1A1A1A; color: #E5E5E5; border: 1px solid #2E2E2E;
       border-radius: 8px; padding: 10px 12px; font-size: 14px; }
     .modelSelect:disabled { color: #7B7B7B; }

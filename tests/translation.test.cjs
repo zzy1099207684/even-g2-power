@@ -8,6 +8,21 @@ const ts = require('typescript')
 const settle = () => new Promise(resolve => setImmediate(resolve))
 const compiled = new Map()
 
+test('translation diagnostics record request progress without source, translation or model key', async t => {
+  const app = startSession(t)
+  app.submit('PRIVATE SOURCE')
+  app.requests[0].respond()
+  await settle()
+  app.requests[0].chunk('PRIVATE RESULT')
+  app.requests[0].finish()
+  await settle()
+  const text = app.logs()
+  assert.match(text, /translation.request/)
+  assert.match(text, /translation.response/)
+  assert.match(text, /translation.done/)
+  for (const value of ['PRIVATE SOURCE', 'PRIVATE RESULT', 'test-only']) assert.ok(!text.includes(value))
+})
+
 // Run the actual translator and transcript. Only the network and clock are
 // controlled: real response streams exercise SSE decoding and cancellation.
 function startSession(t) {
@@ -66,13 +81,16 @@ function startSession(t) {
       })
     },
   })
+  const modules = new Map()
   function load(name) {
+    if (modules.has(name)) return modules.get(name)
     const filename = path.resolve(__dirname, `../src/${name}.ts`)
     if (!compiled.has(filename)) compiled.set(filename, ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
     }).outputText)
     const module = { exports: {} }
-    vm.runInContext(`(function(module, exports) { ${compiled.get(filename)}\n})`, context)(module, module.exports)
+    modules.set(name, module.exports)
+    vm.runInContext(`(function(require, module, exports) { ${compiled.get(filename)}\n})`, context)(name => load(name.replace('./', '')), module, module.exports)
     return module.exports
   }
   const transcript = load('transcript').createTranscript()
@@ -93,6 +111,7 @@ function startSession(t) {
   t.after(() => session.dispose())
   return {
     requests, commits, previews, errors, transcript, session,
+    logs: () => load('diagnostics').diagnostics.exportText(),
     setContext(text) { contextText = text },
     submit(text, passthrough = false) {
       transcript.commitOriginal(text)

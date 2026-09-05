@@ -31,6 +31,11 @@ export function tf(en: string, vars: Record<string, string | number>): string {
 }
 
 const UI_STRINGS_ZH: Record<string, string> = {
+  'Diagnostics': '诊断日志',
+  'Copy all logs': '复制全部日志',
+  'Close': '关闭',
+  'Recent app activity. No keys, audio or conversation text.': '保留近期运行记录, 不含密钥、录音或对话正文.',
+  'Select all below and copy manually.': '已选中日志, 请长按后复制.',
   // Start screen
   'Settings': '设置',
   'History': '历史记录',

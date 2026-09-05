@@ -4,6 +4,7 @@
 
 import { measureTextWrap } from '@evenrealities/pretext'
 import { TextContainerUpgrade, type EvenAppBridge } from '@evenrealities/even_hub_sdk'
+import { diagnostics } from './diagnostics'
 
 const DEBOUNCE_MS = 120
 
@@ -97,6 +98,8 @@ export function createContainerRenderer(
     lastWritten = content
     queue.current = queue.current
       .then(async () => {
+        const startedAt = Date.now()
+        diagnostics.count('glasses.writes')
         let timeoutId: ReturnType<typeof setTimeout> | undefined
         const timeout = new Promise<never>((_, reject) => {
           timeoutId = setTimeout(
@@ -111,9 +114,10 @@ export function createContainerRenderer(
           ])
           // Firmware rejects are otherwise invisible — a failed write leaves the
           // glasses showing stale content while the phone looks fine.
-          if (typeof result === 'number' && result !== 0) {
-            console.warn(`textContainerUpgrade failed (${containerName}):`, result)
-          }
+          if (result === false || (typeof result === 'number' && result !== 0)) {
+            diagnostics.error('glasses', 'write_rejected', new Error('textContainerUpgrade rejected'), { containerID, containerName, result })
+          } else diagnostics.count('glasses.writesOk')
+          diagnostics.gauge('glasses.lastWriteMs', Date.now() - startedAt)
         } finally {
           clearTimeout(timeoutId)
         }
@@ -121,7 +125,7 @@ export function createContainerRenderer(
       .catch(err => {
         // A rejected write must not poison the shared queue chain — one flaky
         // BLE/host error would otherwise kill every write that follows.
-        console.warn(`glasses write error (${containerName}):`, err)
+        diagnostics.error('glasses', 'write_failed', err, { containerID, containerName })
         // A write that died or timed out may never have reached the glasses —
         // forget it so the next schedule() with the same content retries
         // instead of being skipped as already-written.
