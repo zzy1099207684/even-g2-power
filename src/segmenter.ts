@@ -32,7 +32,7 @@ export interface Segmenter {
   addStable(text: string, langs: CharLangs): void
   /** The current revisable draft tail; replaces the previous value. */
   setLive(live: string, langs: CharLangs): void
-  /** Utterance ended: commit the never-confirmed remainder (short tails are held for the next utterance). */
+  /** Utterance ended: commit the never-confirmed remainder, including short replies. */
   end(tail: string, langs: CharLangs): void
   /** The not-yet-committed workspace text — what the live line should show. */
   getPendingText(): string
@@ -190,7 +190,7 @@ export function createSegmenter(callbacks: {
     }
     // The peel seam can leave a leading punctuation mark (",0 …") — segments
     // never start with a stray one, so drop it and shift cutFrom to match.
-    const seam = work.match(/^[^\s\w一-鿿]+/)
+    const seam = work.match(/^[^\s\p{L}\p{N}]+/u)
     if (seam) return { text: work.slice(seam[0].length), cutFrom: cutFrom + seam[0].length }
     return { text: work, cutFrom }
   }
@@ -269,7 +269,7 @@ export function createSegmenter(callbacks: {
         const span = full.slice(lastEnd, i + 1)
         if (normSpan(span).length < MIN_SENT_CHARS) continue
         const peeled = peelRepeated(span)
-        if (normSpan(peeled.text).length >= MIN_SENT_CHARS) {
+        if (/[\p{L}\p{N}]/u.test(peeled.text)) {
           // end() commits final content only — no confirmation is ever owed.
           markSealed(span, false)
           if (peeled.text !== span) markSealed(peeled.text, false)
@@ -277,34 +277,20 @@ export function createSegmenter(callbacks: {
         }
         lastEnd = i + 1
       }
-      // Whatever the clause scan left has no sentence break — the spoken tail
-      // fragment. Long enough to stand alone: peel and commit it as-is. Too
-      // short (same MIN_SENT_CHARS bar as drain): hold it in the workspace so
-      // it merges into the next utterance — choppy speech then costs one
-      // translation request per sentence instead of one per fragment. A held
-      // fragment stays visible as the live line; if no next utterance ever
-      // comes it never seals, which is acceptable for filler-length tails.
+      // The endpoint confirms the remaining speech even when it is a short
+      // reply ("Yes.", "谢谢"). Keep the length threshold while drafting, but
+      // never hold confirmed words for a next utterance that may not arrive.
       const remainder = full.slice(lastEnd)
       if (remainder.trim()) {
         const peeled = peelRepeated(remainder)
-        if (normSpan(peeled.text).length >= MIN_SENT_CHARS) {
+        if (/[\p{L}\p{N}]/u.test(peeled.text)) {
           markSealed(remainder, false)
           if (peeled.text !== remainder) markSealed(peeled.text, false)
           commitClause(peeled.text, lastEnd + peeled.cutFrom, allLangs)
-          stable = ''
-          stableLangs = []
-        } else {
-          // Keep the peeled form (not the raw remainder): the peel set has
-          // already claimed the repeated part, and re-holding it would echo
-          // committed text in the live line until the next drain peels it.
-          // cutFrom keeps text and langs aligned.
-          stable = peeled.text
-          stableLangs = allLangs.slice(lastEnd + peeled.cutFrom)
         }
-      } else {
-        stable = ''
-        stableLangs = []
       }
+      stable = ''
+      stableLangs = []
       // The boundary settles every draft debt — tokens still unconfirmed were
       // delivered in this response's tail — so draft-origin entries lose
       // their dedupe authority: any later repeat is real speech. Runs AFTER

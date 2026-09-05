@@ -1,5 +1,5 @@
 // Growing conversation log: committed (sealed) segments plus the current
-// in-progress segment. Everything the glasses show as "live" is ONE
+// pending preview. Everything the glasses show as "live" is ONE
 // continuous text per lane (original / translation): sealed segments stay,
 // new text appends after a newline, and render.ts's fitTail keeps only the
 // visible tail — so on screen new content appears to push finished lines
@@ -29,7 +29,7 @@ const SEALED_TAIL_CHARS = 1000
 
 export interface Transcript {
   updateCurrentOriginal(text: string): void
-  /** Replace the oldest pending sentence's streamed translation. */
+  /** Replace the ordered preview of pending translations, including gap placeholders. */
   updateCurrentTranslation(text: string): void
   /** Original sealed into the log (clause cut, length backstop or EndOfTurn). */
   commitOriginal(text: string): void

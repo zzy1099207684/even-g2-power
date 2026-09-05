@@ -28,22 +28,20 @@
 // back transcribed in its own language and the filter below drops it, so the
 // display stays silent instead of forcing the words into a hinted language
 // (with `language_hints_strict` the model could only emit hinted languages, so
-// Chinese speech arrived as misheard English). Three nets drop tokens before
+// Chinese speech arrived as misheard English). Two nets drop tokens before
 // they reach the caller: tokens carrying letters from a writing system none of
 // the hinted languages uses, tokens tagged with a language outside
-// `languageHints`, and tokens whose per-token `confidence` (0.0-1.0) is under
-// MIN_TOKEN_CONFIDENCE. The script net exists because the tag net alone is
+// `languageHints`. The script net exists because the tag net alone is
 // not trustworthy: with hints set, the model emits unselected-language speech
 // as its own script but mislabels the tokens with a hinted language (observed:
 // nearby Chinese speech arrived as accurate, confident tokens tagged `en`), so
-// the token's visible characters are the only reliable signal. Far-field or
-// muffled audio additionally comes back as low-confidence tokens even when
-// tagged to a hinted language, so the model's own uncertainty is what keeps
-// misheard noise off the screen. Cost of the nets: heavily accented speech is
-// occasionally lost the same way, and source speech may not borrow words
-// written in another selected language's script. Tokens with no language
-// (spaces, punctuation, markers) are kept unless their own confidence is
-// under the floor.
+// the token's visible characters are the only reliable signal. Source speech
+// may not borrow words written in an unselected language's script. Tokens
+// with no language (spaces, punctuation, markers) are kept.
+//
+// Confidence describes individual tokens, which can be fragments of one word.
+// Preserve all fragments of accepted-language text regardless of confidence;
+// deleting individual fragments can truncate words.
 //
 // That per-token language also reaches the caller: the callbacks carry a
 // per-character language array parallel to the text (entries are undefined for
@@ -53,11 +51,6 @@
 
 /** Per-character source language, parallel to a callback's text. */
 export type CharLangs = (string | undefined)[]
-
-// Tokens scoring below this are treated as misheard noise (far-field or
-// muffled speech) and dropped. Starting guess — tune against the debug
-// overlay's drop feed on a real session.
-export const MIN_TOKEN_CONFIDENCE = 0.82
 
 // One regex per writing system a hinted language can produce. Letters only:
 // digits and punctuation are language-neutral and never drop a token, so a
@@ -108,7 +101,7 @@ export interface StartSonioxStreamOptions {
   onEnd(tail: string, langs: CharLangs): void
   onError?: (err: unknown) => void
   /** Diagnostics: a token dropped by one of the nets (text, reason: script /
-   *  tag language / 'conf'). */
+   *  tag language). */
   onDrop?(text: string, lang: string): void
 }
 
@@ -116,7 +109,6 @@ interface SonioxToken {
   text?: string
   language?: string
   is_final?: boolean
-  confidence?: number
 }
 
 interface SonioxMessage {
@@ -224,16 +216,6 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
         }
         if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) {
           opts.onDrop?.(text, token.language)
-          continue
-        }
-        // Low-confidence net. Word-shaped tokens only: spaces carry a score
-        // too, and dropping them would glue neighbouring words together.
-        if (
-          token.confidence !== undefined &&
-          token.confidence < MIN_TOKEN_CONFIDENCE &&
-          /\S/.test(text)
-        ) {
-          opts.onDrop?.(text, 'conf')
           continue
         }
         if (token.is_final) {

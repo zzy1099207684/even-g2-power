@@ -15,6 +15,7 @@ function appHarness() {
   const requests = []
   const shutdowns = []
   const microphone = []
+  const mirrors = { translation: '' }
   const timers = new Map()
   let callbacks, speech, onEvent
   let nextSpeech
@@ -58,7 +59,10 @@ function appHarness() {
           showStartError: message => screens.push({ error: message }),
           showRunning() {
             screens.push('running')
-            return { setStatus: noOp, setDebug: noOp, setPaused: noOp, setOriginalMirror: noOp, setTranslationMirror: noOp }
+            return {
+              setStatus: noOp, setDebug: noOp, setPaused: noOp, setOriginalMirror: noOp,
+              setTranslationMirror(sealed, current) { mirrors.translation = [...sealed, current].filter(Boolean).join('\n') },
+            }
           },
         }
       },
@@ -70,13 +74,13 @@ function appHarness() {
     },
   }
   const context = vm.createContext({
-    console: { ...console, error: noOp }, AbortController, Request, Response, URLSearchParams, Uint8Array,
+    console: { ...console, error: noOp }, AbortController, Request, Response, TextDecoder, URLSearchParams, Uint8Array,
     location: { search: '' }, window: { addEventListener: noOp },
     setTimeout(fn) { const id = timers.size + 1; timers.set(id, fn); return id },
     clearTimeout: id => timers.delete(id), setInterval: () => 1, clearInterval: noOp,
     fetch(url, init) {
       return new Promise((resolve, reject) => {
-        requests.push({ url, body: JSON.parse(init.body), resolve, reject })
+        requests.push({ url, body: JSON.parse(init.body), signal: init.signal, resolve, reject })
         init.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))
       })
     },
@@ -96,11 +100,12 @@ function appHarness() {
   }
   load(path.resolve(__dirname, '../src/main.ts'))
   return {
-    screens, requests, shutdowns, microphone, storage, bridge,
+    screens, requests, shutdowns, microphone, storage, bridge, mirrors,
     start: enabled => callbacks.onStart(['en'], 'zh-Hans', 'Chinese (Simplified)', {
       relayUrl: 'https://relay.invalid', sonioxKey: 'test-only', model, screenClearSeconds: 15, summaryEnabled: enabled,
     }),
     draft(text) { speech.onLive(text, Array.from(text, () => 'en')) },
+    utterance(text) { speech.onEnd(text, Array.from(text, () => 'en')) },
     end: () => callbacks.onEnd(),
     pause: () => callbacks.onPause(),
     resume: () => callbacks.onResume(),
@@ -115,6 +120,46 @@ function appHarness() {
     expire: () => { for (const fn of [...timers.values()]) fn() },
   }
 }
+
+test('an ended short reply reaches the model without waiting for another utterance', async () => {
+  const app = appHarness()
+  await app.start(false)
+  app.draft('Yes.')
+  app.utterance('Yes.')
+  await settle()
+  assert.deepEqual(app.requests.filter(request => request.url.endsWith('/translate')).map(request => request.body.text), ['Yes.'])
+  await app.end()
+})
+
+test('End saves an already displayed later translation and stops requests before waiting for storage', async t => {
+  const app = appHarness()
+  await app.start(false)
+  app.utterance('First original.')
+  app.utterance('Second original.')
+  const translations = app.requests.filter(request => request.url.endsWith('/translate'))
+  translations[1].resolve(new Response('data: {"choices":[{"delta":{"content":"第二句译文."}}]}\n\ndata: [DONE]\n\n'))
+  await settle()
+  assert.equal(app.mirrors.translation, '…\n第二句译文.')
+
+  let finishStorage
+  t.after(() => finishStorage?.())
+  const persist = app.bridge.setLocalStorage
+  app.bridge.setLocalStorage = (key, value) => new Promise(resolve => {
+    assert.equal(translations[0].signal.aborted, true, 'The slow request must stop before storage starts')
+    finishStorage = async () => resolve(await persist(key, value))
+  })
+  const ending = app.end()
+  await settle()
+  assert.equal(typeof finishStorage, 'function')
+  assert.equal(app.screens.at(-1), 'ending')
+  await finishStorage()
+  await ending
+  await app.end()
+  assert.equal(app.records().length, 1)
+  assert.equal(app.records()[0].original, 'First original.\nSecond original.')
+  assert.equal(app.records()[0].translation, 'First original.\n第二句译文.')
+  assert.equal(app.screens.at(-1).home, true)
+})
 
 test('End saves original without a completed translation, waits for summary, then returns home once', async () => {
   const app = appHarness()

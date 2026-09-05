@@ -132,7 +132,7 @@ test('shows streamed translation before completion and archives it only once whe
   assert.equal(app.commits.length, 1)
 })
 
-test('overlaps requests but publishes completed sentences in speech order', async t => {
+test('previews later completed sentences in place while committing in speech order', async t => {
   const app = startSession(t)
   app.submit('First.')
   app.submit('Second.')
@@ -152,8 +152,9 @@ test('overlaps requests but publishes completed sentences in speech order', asyn
   app.requests[1].chunk('第二句.')
   app.requests[1].finish()
   await settle()
-  assert.equal(app.commits.length, 0, 'Faster later sentences must not overtake the first')
-  assert.equal(app.transcript.getGlassesTranslation(), '')
+  assert.equal(app.commits.length, 0, 'Final commits must still follow speech order')
+  assert.equal(app.transcript.getGlassesTranslation(), '…\n第二句.\n第三句.\n第四句.')
+  assert.equal(app.transcript.getFullTranslation(), '')
   app.requests[0].respond()
   app.requests[0].chunk('第一句.')
   app.requests[0].finish()
@@ -162,7 +163,7 @@ test('overlaps requests but publishes completed sentences in speech order', asyn
   assert.equal(app.transcript.getFullTranslation(), '第一句.\n第二句.\n第三句.\n第四句.')
 })
 
-test('reveals the next sentence draft as soon as its predecessor commits', async t => {
+test('previews later drafts behind a placeholder and replaces the placeholder as the first streams', async t => {
   const app = startSession(t)
   app.submit('First.')
   app.submit('Second.')
@@ -170,9 +171,12 @@ test('reveals the next sentence draft as soon as its predecessor commits', async
   app.requests[1].respond()
   app.requests[1].chunk('下一句')
   await settle()
-  assert.equal(app.transcript.getGlassesTranslation(), '')
+  assert.equal(app.transcript.getGlassesTranslation(), '…\n下一句')
   app.requests[0].respond()
-  app.requests[0].chunk('第一句.')
+  app.requests[0].chunk('第一')
+  await settle()
+  assert.equal(app.transcript.getGlassesTranslation(), '第一\n下一句')
+  app.requests[0].chunk('句.')
   app.requests[0].finish()
   await settle()
   assert.equal(app.transcript.getGlassesTranslation(), '第一句.\n下一句')
@@ -210,6 +214,7 @@ test('same-language speech skips the model without overtaking pending translatio
   app.submit('Third.')
   assert.deepEqual(app.requests.map(request => request.body.text), ['First.', 'Third.'])
   assert.equal(app.commits.length, 0)
+  assert.equal(app.transcript.getGlassesTranslation(), '…\n这句无需翻译.')
   app.requests[0].respond()
   app.requests[0].chunk('第一句.')
   app.requests[0].finish()
@@ -302,39 +307,29 @@ test('an overloaded queue keeps original fallback sentences in their correct pos
   ])
 })
 
-test('ending the app stops translation before waiting for history storage', async t => {
+test('finish saves completed previews and original fallbacks once without waiting or retrying', async t => {
   const app = startSession(t)
-  app.submit('Finished original.')
+  app.submit('First original.')
+  app.submit('Second original.')
+  app.submit('Third original.')
+  app.submit('Fourth original.')
+  app.submit('这句无需翻译.', true)
   app.requests[0].respond()
-  app.requests[0].chunk('已完成.')
-  app.requests[0].finish()
-  await settle()
-  app.submit('Still translating.')
+  app.requests[0].chunk('未完成')
   app.requests[1].respond()
-  app.requests[1].chunk('未完成')
+  app.requests[1].chunk('第二句译文.')
+  app.requests[1].finish()
   await settle()
-
-  let finishStorage
-  let archived
-  let exited = false
-  const filename = path.resolve(__dirname, '../src/main.ts')
-  const source = fs.readFileSync(filename, 'utf8')
-  const ast = ts.createSourceFile(filename, source, ts.ScriptTarget.ES2022, true)
-  const end = ast.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'endSession')
-  const code = ts.transpileModule(end.getText(ast), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
-  const context = vm.createContext({
-    console, transcript: app.transcript, startLanguages: ['en'], startTargetLang: 'Chinese',
-    bridgeRef: { audioControl() {}, async shutDownPageContainer() { exited = true; return true } },
-    addRecord(record) { archived = record; return new Promise(resolve => { finishStorage = resolve }) },
-    teardownSession: () => app.session.dispose(),
-  })
-  vm.runInContext(code, context)
-  const ending = vm.runInContext('endSession()', context)
-  const stoppedBeforeStorage = app.requests[1].signal.aborted
-  assert.equal(exited, false, 'History should still finish before app exit')
-  finishStorage()
-  await ending
-  assert.equal(stoppedBeforeStorage, true, 'Translation must stop as soon as End is pressed')
-  assert.equal(archived.translation, '已完成.', 'Only finalized translation belongs in history')
-  assert.equal(exited, true)
+  const requestCount = app.requests.length
+  app.session.finish()
+  assert.equal(app.transcript.getFullTranslation(), 'First original.\n第二句译文.\nThird original.\nFourth original.\n这句无需翻译.')
+  assert.equal(app.transcript.getCurrentTranslation(), '')
+  assert.equal(app.commits.length, 5)
+  app.session.finish()
+  app.session.submitFinal('Too late.')
+  await settle()
+  await app.advance(30_000)
+  assert.ok(app.requests.filter(request => request.body.text !== 'Second original.').every(request => request.signal.aborted))
+  assert.equal(app.requests.length, requestCount)
+  assert.equal(app.commits.length, 5, 'Late abort callbacks and repeated End must not append again')
 })

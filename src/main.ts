@@ -251,7 +251,7 @@ let sttGen = 0
 // handshake, so the new socket gets quiet syllables as well as loud ones.
 const IDLE_DISCONNECT_AFTER_MS = 15_000
 const IDLE_WAKE_FACTOR = 1.5 // initial balanced setting; calibrate with device audio
-const IDLE_WAKE_RMS_MIN = 250 // absolute floor, so a dead-silent room still needs a real voice
+const IDLE_WAKE_RMS_MIN = 1000 // absolute floor, so a dead-silent room still needs a real voice
 const IDLE_VERIFY_AFTER_MS = 5_000 // woken but no tokens by then → it was noise
 const IDLE_WAKE_SUPPRESS_MS = 2_000 // cooldown after a noise false-positive
 const IDLE_PRE_ROLL_PCM_CAP = 25_600 // 800ms @16kHz s16le before the wake trigger
@@ -264,8 +264,8 @@ const NOISE_FLOOR_ALPHA = 0.05 // EMA step, ~2s time constant @100ms frames
 // confidently into hinted-language words, so keeping them off the wire is the
 // only reliable net. After a loud frame the gate stays open briefly so the
 // quiet syllables of real near speech are not chopped.
-const SEND_GATE_FACTOR = 1.1 // forward frames louder than floor × this
-const SEND_GATE_HOLD_MS = 2_500 // keep forwarding this long after a loud frame
+const SEND_GATE_FACTOR = 1.5 // forward frames louder than floor × this
+const SEND_GATE_HOLD_MS = 3_000 // keep forwarding this long after a loud frame
 
 let idleDisconnected = false
 let waking = false
@@ -607,6 +607,7 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
       if (!passthrough) dbg.tSub++
       session2.submitFinal(text, passthrough)
     },
+    finish: () => session2.finish(),
     dispose: () => session2.dispose(),
   }
   startIdleBlink()
@@ -646,20 +647,25 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
       if (rms < noiseFloor * 1.5) noiseFloor += (rms - noiseFloor) * NOISE_FLOOR_ALPHA
       dbg.noiseFloor = noiseFloor
 
+      // Retire an expired stream before routing this frame. The frame may
+      // be a new speech onset, so it must enter the idle wake buffer rather
+      // than be dropped or sent to a socket that is about to close.
       if (stt) {
         if (wakeVerifyPending && Date.now() - wakeConnectedAt >= IDLE_VERIFY_AFTER_MS) {
           // Woken by noise: Soniox never recognized a token. Drop the socket
-          // and stop listening for a cooldown so ambient sound can't loop us.
+          // and defer reconnecting during cooldown; keep buffering the mic.
           wakeVerifyPending = false
           wakeSuppressUntil = Date.now() + IDLE_WAKE_SUPPRESS_MS
           idleDisconnectStt()
-        } else {
-          if (rms > noiseFloor * SEND_GATE_FACTOR) sendGateOpenUntil = Date.now() + SEND_GATE_HOLD_MS
-          if (Date.now() < sendGateOpenUntil) stt.sendPcm(pcm)
-          if (Date.now() - lastSpeechAt >= IDLE_DISCONNECT_AFTER_MS) idleDisconnectStt()
+        } else if (Date.now() - lastSpeechAt >= IDLE_DISCONNECT_AFTER_MS) {
+          idleDisconnectStt()
         }
-      } else if (idleDisconnected) {
+      }
+      if (idleDisconnected) {
         onPcmWhileIdle(pcm, rms)
+      } else if (stt) {
+        if (rms > noiseFloor * SEND_GATE_FACTOR) sendGateOpenUntil = Date.now() + SEND_GATE_HOLD_MS
+        if (Date.now() < sendGateOpenUntil) stt.sendPcm(pcm)
       }
     }
 
@@ -906,7 +912,7 @@ function recordCommit(text: string): void {
 // every translate request, so the model can resolve pronouns and ellipsis
 // across segment cuts. Appended only AFTER a segment's submitFinal: requests
 // for a segment must not see that segment in its own context.
-const CONTEXT_MAX_CHARS = 300
+const CONTEXT_MAX_CHARS = 500
 // A silence this long means the conversation has moved on — pause, idle gap —
 // so the window's referents are stale. Dropped at the next append, the only
 // moment the window is actually read, which covers every gap source at once.
@@ -1121,6 +1127,9 @@ async function endSession() {
   ending = true
   const session = activeSession
   const model = getSelectedModel() ?? session.model
+  // Preserve later completed previews before snapshotting; unfinished
+  // requests become original-text fallbacks without waiting for the network.
+  translationSession?.finish()
   const original = transcript?.getFullOriginal().trim() ?? ''
   const translation = transcript?.getFullTranslation().trim() ?? ''
   const shouldSummarize = session.summaryEnabled === true && !!original

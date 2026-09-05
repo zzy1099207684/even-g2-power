@@ -1,12 +1,14 @@
-// Translate up to three sealed segments at once. Only the oldest unfinished
-// segment may stream to the display; completed results still commit in
-// speech order, including same-language passthrough and error fallbacks.
+// Translate up to three sealed segments at once. Preview available results
+// in speech order, with placeholders for earlier gaps. Final results still
+// commit in order, including same-language passthrough and error fallbacks.
 
 import type { ModelProfile } from './config'
 
 export interface TranslationSession {
   /** Passthrough skips the model but keeps the sentence in display order. */
   submitFinal(text: string, passthrough?: boolean): void
+  /** Stop requests and commit completed results, using originals for unfinished segments. */
+  finish(): void
   dispose(): void
 }
 
@@ -44,7 +46,7 @@ export function createTranslationSession(
   getContext?: () => string,
   /** Read per request so a model switch applies to the next request. */
   getModel?: () => ModelProfile | null,
-  /** Replace the current translation draft; never append it to the archive. */
+  /** Replace the pending segments' ordered preview; never append it to the archive. */
   onPartial?: (text: string) => void,
 ): TranslationSession {
   const queue: QueuedSegment[] = []
@@ -65,7 +67,13 @@ export function createTranslationSession(
       onCommit(entry.result, entry.passthrough)
       lastPreview = ''
     }
-    const draft = queue[0]?.draft ?? ''
+    // Show later text immediately without moving it ahead of earlier speech.
+    // Trailing empty requests need no placeholders until later text exists.
+    const previewEnd = queue.reduce((end, entry, index) =>
+      entry.state === 'done' || entry.draft ? index + 1 : end, 0)
+    const draft = queue.slice(0, previewEnd)
+      .map(entry => entry.state === 'done' ? entry.result : entry.draft || '…')
+      .join('\n')
     if (draft !== lastPreview) {
       lastPreview = draft
       onPartial?.(draft)
@@ -206,6 +214,13 @@ export function createTranslationSession(
     }
   }
 
+  function stopRequests() {
+    disposed = true
+    if (wakeTimer !== null) clearTimeout(wakeTimer)
+    for (const controller of controllers) controller.abort()
+    controllers.clear()
+  }
+
   return {
     submitFinal(text, passthrough = false) {
       if (!text || disposed) return
@@ -220,12 +235,20 @@ export function createTranslationSession(
       })
       pump()
     },
-    dispose() {
-      disposed = true
-      if (wakeTimer !== null) clearTimeout(wakeTimer)
+    finish() {
+      if (disposed) return
+      // End must preserve completed previews even if an earlier request is
+      // still running. Stop first so late responses cannot append them twice.
+      stopRequests()
+      for (const entry of queue) {
+        onCommit(entry.state === 'done' ? entry.result : entry.text, entry.passthrough)
+      }
       queue.length = 0
-      for (const controller of controllers) controller.abort()
-      controllers.clear()
+      onPartial?.('')
+    },
+    dispose() {
+      stopRequests()
+      queue.length = 0
     },
   }
 }

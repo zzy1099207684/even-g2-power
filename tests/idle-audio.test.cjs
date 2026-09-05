@@ -168,7 +168,26 @@ test('ordinary audio that was sent while connected also wakes an idle session', 
   app.frame(600)
   assert.equal(app.sockets.length, 2)
   await app.sockets[1].open()
-  assertAudio(app.sockets[1].bytes, [600])
+  assertAudio(app.sockets[1].bytes, [300, 600])
+})
+
+test('speech at the idle deadline reaches the new socket with its quiet continuation', async () => {
+  const app = await startApp()
+  app.advance(15_000)
+  for (const amplitude of [1000, 220, 210]) app.frame(amplitude)
+  assert.equal(app.sockets.length, 2, 'The onset must request a new stream immediately')
+  assertAudio(app.sockets[0].bytes, [])
+  await app.sockets[1].open()
+  assertAudio(app.sockets[1].bytes, [1000, 220, 210])
+})
+
+test('a quiet onset at the idle deadline remains in the next wake pre-roll', async () => {
+  const app = await startApp()
+  app.advance(15_000)
+  for (const amplitude of [320, 1000, 220]) app.frame(amplitude)
+  assert.equal(app.sockets.length, 2)
+  await app.sockets[1].open()
+  assertAudio(app.sockets[1].bytes, [320, 1000, 220])
 })
 
 test('replays quiet onset and every handshake frame in their original order', async () => {
@@ -177,7 +196,7 @@ test('replays quiet onset and every handshake frame in their original order', as
   for (const amplitude of [320, 330, 340, 1000, 220, 210]) app.frame(amplitude)
   assert.equal(app.sockets.length, 2)
   await app.sockets[1].open()
-  assertAudio(app.sockets[1].bytes, [320, 330, 340, 1000, 220, 210])
+  assertAudio(app.sockets[1].bytes, [300, 320, 330, 340, 1000, 220, 210])
 })
 
 test('keeps forwarding quiet syllables immediately after the socket wakes', async () => {
@@ -188,7 +207,7 @@ test('keeps forwarding quiet syllables immediately after the socket wakes', asyn
   app.frame(200)
   app.advance(2200)
   app.frame(200)
-  assertAudio(app.sockets[1].bytes, [1000, 200, 200])
+  assertAudio(app.sockets[1].bytes, [300, 1000, 200, 200])
 })
 
 test('room noise does not wake a session and only the recent 800 ms precedes speech', async () => {
@@ -215,7 +234,25 @@ test('cooldown defers reconnecting without removing the softer parts of speech',
   app.frame(200)
   assert.equal(app.sockets.length, 3)
   await app.sockets[2].open()
-  assertAudio(app.sockets[2].bytes, [1000, 260, 280, 200])
+  assertAudio(app.sockets[2].bytes, [300, 1000, 260, 280, 200])
+})
+
+test('speech at the wake verification deadline survives cooldown and still triggers a wake', async () => {
+  const app = await startApp()
+  app.idle()
+  app.frame(1000)
+  await app.sockets[1].open()
+  const previousAudio = app.sockets[1].bytes
+  app.advance(5000)
+  for (const amplitude of [1200, 220, 210]) app.frame(amplitude)
+  assert.equal(app.sockets[1].readyState, 3)
+  assert.equal(app.sockets.length, 2, 'Keep the noise cooldown before reconnecting')
+  assert.ok(app.sockets[1].bytes.equals(previousAudio), 'New speech must not go to the retired stream')
+  app.advance(2000)
+  app.frame(200)
+  assert.equal(app.sockets.length, 3, 'The buffered onset must wake even when later frames are quiet')
+  await app.sockets[2].open()
+  assertAudio(app.sockets[2].bytes, [1200, 220, 210, 200])
 })
 
 test('pause discards pending audio and a late wake cannot replace the resumed socket', async () => {
@@ -249,7 +286,7 @@ test('a stale wake completion cannot clear audio belonging to a newer wake', asy
   app.frame(200)
   assert.equal(app.sockets.length, 4)
   await app.sockets[3].open()
-  assertAudio(app.sockets[3].bytes, [1000, 200])
+  assertAudio(app.sockets[3].bytes, [300, 1000, 200])
 })
 
 test('a pre-pause handshake failure cannot reconnect the healthy resumed socket', async () => {
