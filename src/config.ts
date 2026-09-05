@@ -40,12 +40,23 @@ export interface UiConfig {
    *  defaults below. */
   historyRetentionDays?: number
   historyMaxRecords?: number
+  /** Seconds of content silence before the glasses' live view resets to a
+   *  fresh page. Optional in stored and debug payloads — loadUiConfig
+   *  resolves absent/invalid values to the default below. */
+  screenClearSeconds?: number
+  /** Companion-UI language ('en' | 'zh'). Optional in stored payloads —
+   *  loadUiConfig resolves absent values to 'en'. */
+  uiLang?: string
 }
 
 // Defaults applied when a config predates the history-retention fields or
 // carries invalid ones. Also the placeholder hints in the Settings inputs.
 export const DEFAULT_HISTORY_RETENTION_DAYS = 30
 export const DEFAULT_HISTORY_MAX_RECORDS = 200
+export const DEFAULT_SCREEN_CLEAR_SECONDS = 15
+// Floor for screenClearSeconds: below 5 the idle marker's big-dot phase
+// (MARKER_RETURN_AFTER_MS) could never show before the screen clears.
+export const MIN_SCREEN_CLEAR_SECONDS = 5
 
 // Everything handleStart needs from the settings screen, resolved and
 // validated there before the session opens.
@@ -53,6 +64,8 @@ export interface SessionConfig {
   relayUrl: string
   sonioxKey: string
   model: ModelProfile
+  /** Seconds of silence before the glasses' live view clears to a fresh page. */
+  screenClearSeconds: number
 }
 
 const STORAGE_KEY = 'g2-translate-config'
@@ -64,8 +77,7 @@ export async function loadUiConfig(): Promise<UiConfig | null> {
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<UiConfig>
     if (!Array.isArray(parsed.sources) || typeof parsed.target !== 'string') return null
-    // Older saves predate the service fields (or still carry the retired
-    // Deepgram key) — default them to empty so the stored language selection
+    // Missing service fields default to empty so the stored language selection
     // still applies and Settings asks for the rest.
     return {
       sources: parsed.sources,
@@ -98,6 +110,11 @@ export async function loadUiConfig(): Promise<UiConfig | null> {
         typeof parsed.historyMaxRecords === 'number' && parsed.historyMaxRecords >= 1
           ? parsed.historyMaxRecords
           : DEFAULT_HISTORY_MAX_RECORDS,
+      screenClearSeconds:
+        typeof parsed.screenClearSeconds === 'number' && parsed.screenClearSeconds >= MIN_SCREEN_CLEAR_SECONDS
+          ? parsed.screenClearSeconds
+          : DEFAULT_SCREEN_CLEAR_SECONDS,
+      uiLang: parsed.uiLang === 'zh' ? 'zh' : 'en',
     }
   } catch {
     return null // no saved config yet, or storage unavailable — defaults apply

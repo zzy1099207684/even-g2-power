@@ -10,8 +10,15 @@ import { createTranslationSession, type TranslationSession } from './translate'
 import { createTranscript, type Transcript } from './transcript'
 import { createSegmenter, type Segmenter } from './segmenter'
 import { addRecord } from './history'
-import { loadUiConfig, type SessionConfig, type UiConfig } from './config'
+import {
+  DEFAULT_SCREEN_CLEAR_SECONDS,
+  MIN_SCREEN_CLEAR_SECONDS,
+  loadUiConfig,
+  type SessionConfig,
+  type UiConfig,
+} from './config'
 import { mountUi, getSelectedModel, type RunningUiHandle } from './ui'
+import { t } from './i18n'
 import { createWriteQueue, createContainerRenderer, fitTail, type ContainerBox, type ContainerRenderer } from './render'
 
 type DisplayMode = 'both' | 'translationOnly'
@@ -162,6 +169,11 @@ if (dbgCfgRaw) {
         relayUrl: cfg.relayUrl,
         sonioxKey: cfg.sonioxKey,
         model,
+        // Raw debug payload — same normalization loadUiConfig would apply.
+        screenClearSeconds:
+          typeof cfg.screenClearSeconds === 'number' && cfg.screenClearSeconds >= MIN_SCREEN_CLEAR_SECONDS
+            ? cfg.screenClearSeconds
+            : DEFAULT_SCREEN_CLEAR_SECONDS,
       })
     } catch (err) {
       console.error('dbgcfg failed:', err)
@@ -230,26 +242,38 @@ let sttGen = 0
 // is speech": a local one (RMS well above the learned room noise floor) and
 // Soniox itself (a woken socket that recognizes no token within
 // IDLE_VERIFY_AFTER_MS was noise — it gets dropped and put on a cooldown).
-// Frames arriving while the wake handshake runs are buffered and replayed
-// into the new socket, so words spoken into that gap are not lost.
+// Keep a short onset window before a wake, then every frame through the
+// handshake, so the new socket gets quiet syllables as well as loud ones.
 const IDLE_DISCONNECT_AFTER_MS = 15_000
-const IDLE_WAKE_FACTOR = 3 // wake when RMS exceeds the room floor by this much
+const IDLE_WAKE_FACTOR = 1.5 // initial balanced setting; calibrate with device audio
 const IDLE_WAKE_RMS_MIN = 250 // absolute floor, so a dead-silent room still needs a real voice
 const IDLE_VERIFY_AFTER_MS = 5_000 // woken but no tokens by then → it was noise
 const IDLE_WAKE_SUPPRESS_MS = 2_000 // cooldown after a noise false-positive
+const IDLE_PRE_ROLL_PCM_CAP = 25_600 // 800ms @16kHz s16le before the wake trigger
 const IDLE_WAKE_PCM_CAP = 320_000 // ~10s @16kHz s16le — bounds memory if reconnects stall
 const NOISE_FLOOR_ALPHA = 0.05 // EMA step, ~2s time constant @100ms frames
+
+// Send gate: while the stream is connected, frames at room-noise level are
+// not forwarded. Far-field or muffled voices arrive barely above the floor
+// (observed: a mumble at rms 189 vs floor 187) yet Soniox transcribes them
+// confidently into hinted-language words, so keeping them off the wire is the
+// only reliable net. After a loud frame the gate stays open briefly so the
+// quiet syllables of real near speech are not chopped.
+const SEND_GATE_FACTOR = 1.1 // forward frames louder than floor × this
+const SEND_GATE_HOLD_MS = 2_500 // keep forwarding this long after a loud frame
 
 let idleDisconnected = false
 let waking = false
 let wakePcm: Uint8Array[] = []
 let wakePcmBytes = 0
+let wakeRequested = false // quiet pre-roll alone must never reopen the socket
 let lastWakeAttemptAt = 0
 // Room noise floor, learned from frames well below it (speech never raises it).
 let noiseFloor = 300
 let wakeVerifyPending = false // set on wake, cleared by the first recognized token
 let wakeConnectedAt = 0
 let wakeSuppressUntil = 0
+let sendGateOpenUntil = 0 // frames forward only while now is before this
 
 // Speech is flowing (a stable delta, a fresh draft, or the utterance tail
 // just landed): keep the idle marker quiet and mirror the segmenter's
@@ -257,18 +281,23 @@ let wakeSuppressUntil = 0
 // carry stabilized text — only those may light the screen back up from the
 // dim state; a noise draft repaints nothing and leaves the marker dim.
 function afterSpeechEvent(content: boolean): void {
+  maybeCutLiveView()
   speechStarted = true
   lastSpeechAt = Date.now()
   if (content) lastContentAt = Date.now()
   wakeVerifyPending = false // real speech on a freshly woken socket — it passes
   if (displayDim()) return
-  hideMarker() // speech is back — hide the marker immediately
   transcript?.updateCurrentOriginal(segmenter?.getPendingText() ?? '')
   renderGlasses()
   renderPhone()
+  // The marker may only hide while the event actually left text on screen —
+  // hiding it over empty lanes is what blanked the glasses after a noise
+  // burst that recognized nothing. Reads the just-updated draft line.
+  if (speechVisible()) hideMarker()
 }
 
 async function openStt(languages: string[], session: SessionConfig): Promise<SttClient> {
+  const gen = sttGen
   const client = await startSonioxStream({
     apiKey: session.sonioxKey,
     languageHints: languages,
@@ -294,7 +323,10 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
       dbg.finals++
       dbg.lastFinalLen = tail.length
       segmenter?.end(tail, langs)
-      afterSpeechEvent(true)
+      // An empty tail means nothing was recognized — noise, not speech. It
+      // must not count as content, or it resets the dim clock and bypasses
+      // the dim guard, leaving the marker hidden over an empty screen.
+      afterSpeechEvent(tail.trim().length > 0)
     },
     onDrop: (text, lang) => {
       dbg.dropped++
@@ -305,6 +337,7 @@ async function openStt(languages: string[], session: SessionConfig): Promise<Stt
       }
     },
     onError: err => {
+      if (gen !== sttGen) return // a retired connection cannot reopen the current one
       dbg.errors++
       renderDbg()
       runningUi?.setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
@@ -356,7 +389,7 @@ function idleDisconnectStt() {
   stt.close()
   stt = null
   idleDisconnected = true
-  runningUi?.setStatus('listening', 'Idle · mic listening, reopens on speech')
+  runningUi?.setStatus('listening', t('Idle · mic listening, reopens on speech'))
 }
 
 // Root-mean-square of an s16le little-endian mono chunk.
@@ -370,12 +403,12 @@ function pcmRms(chunk: Uint8Array): number {
   return count ? Math.sqrt(sumSquares / count) : 0
 }
 
-function bufferWakePcm(pcm: Uint8Array) {
+function bufferWakePcm(pcm: Uint8Array, cap: number) {
   wakePcm.push(pcm)
   wakePcmBytes += pcm.length
   // Over cap: drop the OLDEST audio — the newest end (what was just said)
-  // must survive. Reaching the cap at all takes ~10s of continuous sound.
-  while (wakePcmBytes > IDLE_WAKE_PCM_CAP) {
+  // must survive. Before a trigger, retain only the short onset window.
+  while (wakePcmBytes > cap) {
     const oldest = wakePcm.shift()!
     wakePcmBytes -= oldest.length
   }
@@ -384,23 +417,18 @@ function bufferWakePcm(pcm: Uint8Array) {
 function clearWakeBuffer() {
   wakePcm = []
   wakePcmBytes = 0
+  wakeRequested = false
 }
 
-// Speech on the audio path while disconnected. During the cooldown after a
-// noise false-positive, loud frames are only buffered — no connecting. Once
-// the cooldown ends, ANY buffered audio triggers a wake and replays into the
-// new socket, so speech that lands in a cooldown is late by at most
-// IDLE_WAKE_SUPPRESS_MS, never lost. Retries are frame-driven, throttled by
-// lastWakeAttemptAt.
+// Quiet idle frames build pre-roll. A loud frame latches a wake request;
+// all following frames survive cooldown, retry throttling and the handshake
+// up to the buffer cap. Buffered room noise alone cannot trigger a wake.
 function onPcmWhileIdle(pcm: Uint8Array, rms: number) {
   if (sttRetries >= 3) return // same give-up contract as scheduleSttReopen
   const loud = rms > Math.max(noiseFloor * IDLE_WAKE_FACTOR, IDLE_WAKE_RMS_MIN)
-  if (Date.now() < wakeSuppressUntil) {
-    if (loud) bufferWakePcm(pcm) // cooldown: record, don't reconnect
-    return
-  }
-  if (loud) bufferWakePcm(pcm)
-  else if (wakePcmBytes === 0) return // quiet and nothing pending — nothing to say
+  if (loud) wakeRequested = true
+  bufferWakePcm(pcm, wakeRequested ? IDLE_WAKE_PCM_CAP : IDLE_PRE_ROLL_PCM_CAP)
+  if (!wakeRequested || Date.now() < wakeSuppressUntil) return
   if (!waking) void wakeStt()
 }
 
@@ -414,23 +442,25 @@ async function wakeStt() {
     const client = await openStt(startLanguages, activeSession)
     if (gen !== sttGen || !activeSession || paused || cleanedUp) {
       client.close()
-      clearWakeBuffer()
       return
     }
     stt = client
     idleDisconnected = false
     wakeVerifyPending = true // Soniox now adjudicates: tokens = speech, silence = noise
     wakeConnectedAt = Date.now()
+    // The trigger may be long past by now; keep the following soft syllables
+    // flowing for the same hold window as a loud frame on a connected stream.
+    sendGateOpenUntil = wakeConnectedAt + SEND_GATE_HOLD_MS
     const buffered = wakePcm
     clearWakeBuffer()
     for (const chunk of buffered) client.sendPcm(chunk) // replay pre-handshake audio
     runningUi?.setStatus('listening', listeningStatusText())
   } catch {
-    // Stay idle and let the next loud frame retry — no error flash for a
+    // Stay idle and retry the pending audio on later frames — no error flash for a
     // transient handshake miss. sttRetries reaching 3 (checked on the frame
     // path) ends the cycle, same contract as scheduleSttReopen.
   } finally {
-    waking = false
+    if (gen === sttGen) waking = false
   }
 }
 
@@ -438,8 +468,8 @@ async function wakeStt() {
 // caller that restores it after an error or a mode/pause transition.
 function listeningStatusText(): string {
   return displayMode === 'both'
-    ? 'Microphone live · glasses: original + translation'
-    : 'Microphone live · glasses: translation only'
+    ? t('Microphone live · glasses: original + translation')
+    : t('Microphone live · glasses: translation only')
 }
 
 // Keeps lastStatus in step with whatever the phone is actually showing.
@@ -457,6 +487,7 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   startLanguages = languages
   startTargetCode = targetCode.split('-')[0] // 'zh-Hans' → 'zh' for the marker
   startTargetLang = targetLabel
+  markerDimAfterMs = session.screenClearSeconds * 1_000
   ui.showConnecting()
 
   const bridge = await bridgePromise
@@ -464,7 +495,7 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   try {
     stt = await openStt(languages, session)
   } catch (err) {
-    ui.showStartError((err as Error)?.message ?? 'Failed to start speech recognition')
+    ui.showStartError((err as Error)?.message ?? t('Failed to start speech recognition'))
     return
   }
   activeSession = session
@@ -524,8 +555,9 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   const session2 = createTranslationSession(
     session.relayUrl,
     targetLabel,
-    text => {
-      dbg.tDone++
+    (text, passthrough) => {
+      if (!passthrough) dbg.tDone++
+      maybeCutLiveView()
       transcript?.commitTranslation(text)
       // A landed translation means the translate lane recovered. The error
       // banner is only ever "last error", not a live state — when it is
@@ -549,11 +581,22 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
     // Polled per request so a model switch in the running screen's dropdown
     // applies from the next segment on; the in-flight request keeps its model.
     getSelectedModel,
+    text => {
+      if (text) {
+        maybeCutLiveView()
+        lastSpeechAt = Date.now()
+        lastContentAt = Date.now()
+      }
+      transcript?.updateCurrentTranslation(text)
+      renderGlasses()
+      renderPhone()
+      if (speechVisible()) hideMarker()
+    },
   )
   translationSession = {
-    submitFinal(text) {
-      dbg.tSub++
-      session2.submitFinal(text)
+    submitFinal(text, passthrough) {
+      if (!passthrough) dbg.tSub++
+      session2.submitFinal(text, passthrough)
     },
     dispose: () => session2.dispose(),
   }
@@ -589,7 +632,8 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
           wakeSuppressUntil = Date.now() + IDLE_WAKE_SUPPRESS_MS
           idleDisconnectStt()
         } else {
-          stt.sendPcm(pcm)
+          if (rms > noiseFloor * SEND_GATE_FACTOR) sendGateOpenUntil = Date.now() + SEND_GATE_HOLD_MS
+          if (Date.now() < sendGateOpenUntil) stt.sendPcm(pcm)
           if (Date.now() - lastSpeechAt >= IDLE_DISCONNECT_AFTER_MS) idleDisconnectStt()
         }
       } else if (idleDisconnected) {
@@ -645,7 +689,7 @@ function renderGlasses() {
 function renderPhone() {
   if (!transcript) return
   runningUi?.setOriginalMirror(transcript.getOriginalLines(), transcript.getCurrentOriginal())
-  runningUi?.setTranslationMirror(transcript.getTranslationLines())
+  runningUi?.setTranslationMirror(transcript.getTranslationLines(), transcript.getCurrentTranslation())
 }
 
 // Idle marker: a dedicated text strip pinned to the top of the page — the
@@ -654,14 +698,18 @@ function renderPhone() {
 // after End (every updateImageRawData sendfails), while text writes keep
 // working. Visible immediately when the session opens; blank while speech
 // or translation is live; back after 5s of silence, blinking its dot. Text
-// has no gray control, so "dim" after 15s of silence (matching the STT idle
-// disconnect) means a small dot on a 1-in-4 duty cycle — and the lanes
-// blank at the same point, leaving just this one strip lit.
+// has no gray control, so "dim" after markerDimAfterMs of silence means a
+// small dot on a 1-in-4 duty cycle — and the lanes blank at the same point,
+// leaving just this one strip lit.
 // renderGlasses() repaints the full transcript on the next update, so
 // blanking loses nothing.
 const MARKER_BLINK_MS = 900
 const MARKER_RETURN_AFTER_MS = 5_000
-const MARKER_DIM_AFTER_MS = 15_000
+// Silence this long blanks the lanes and switches the marker to the slow
+// small dot — and the live view then resets on the next content, so speech
+// resuming opens a fresh page (maybeCutLiveView). Per session from Settings
+// → Display; the default matches the STT idle disconnect (15 s).
+let markerDimAfterMs = DEFAULT_SCREEN_CLEAR_SECONDS * 1_000
 const MARKER_BOX: ContainerBox = { innerWidth: 576, maxLines: 1 }
 
 let markerTimer: ReturnType<typeof setInterval> | null = null
@@ -676,7 +724,30 @@ let lastSpeechAt = 0 // epoch ms of the last recognized or translated update
 let lastContentAt = 0
 
 function displayDim(): boolean {
-  return Date.now() - lastContentAt >= MARKER_DIM_AFTER_MS
+  return Date.now() - lastContentAt >= markerDimAfterMs
+}
+
+// Whether any speech text is actually on the glasses right now: the lane
+// tails plus the live draft (both mode shows the draft in the original
+// lane; translationOnly never displays it, so only the translation lane
+// counts there). The marker may only hide while this holds — hiding it
+// over an empty screen is what blanked the glasses after a noise burst
+// that recognized nothing.
+function speechVisible(): boolean {
+  if (!transcript) return false
+  if (displayMode === 'both' && transcript.getGlassesOriginal()) return true
+  return !!transcript.getGlassesTranslation()
+}
+
+// Silence has gone on long enough that the screen went dark — content
+// resuming should open a fresh page, not drag the pre-silence text back
+// with it. Cut the live view (lane tails + draft); sealed history, scroll
+// and the phone mirror keep everything. Called on each content-arriving
+// path BEFORE lastContentAt is refreshed, so the gap measured here is the
+// real silence gap. Clearing an already-empty view is a no-op, so repeated
+// calls within one silence are harmless.
+function maybeCutLiveView(): void {
+  if (Date.now() - lastContentAt >= markerDimAfterMs) transcript?.cutLiveView()
 }
 
 function renderMarker(dim: boolean, dotOn: boolean) {
@@ -702,7 +773,10 @@ function markerTick() {
   // Measured from lastContentAt, not lastSpeechAt: drafts keep the STT socket
   // alive (billing) but must not keep the screen lit or un-dim the marker.
   const silentFor = Date.now() - lastContentAt
-  if (speechStarted && silentFor < MARKER_RETURN_AFTER_MS) {
+  // The return-hold only applies while text is actually on screen. Holding
+  // over an empty screen is the other half of the noise blank-out — the
+  // marker comes straight back when nothing was recognized.
+  if (speechStarted && silentFor < MARKER_RETURN_AFTER_MS && speechVisible()) {
     hideMarker()
     markerTicks = 0
     return
@@ -712,7 +786,10 @@ function markerTick() {
   if (dim) {
     // Screen-off: the lanes go dark with the marker. They repaint from the
     // transcript on the next commit, translation, or history scroll — each
-    // path calls renderGlasses(), which writes the full document.
+    // path calls renderGlasses(), which writes the full document. When
+    // content eventually resumes after this, maybeCutLiveView has already
+    // dropped the pre-silence text from the live view, so the lanes come
+    // back showing only the new turn.
     originalRenderer?.schedule('')
     translationRenderer?.schedule('')
   }
@@ -772,14 +849,12 @@ function isTargetLang(lang: string | undefined): boolean {
 function commitSegment(segment: string, langs: CharLangs): void {
   const trimmed = segment.trim()
   if (!trimmed) return
+  maybeCutLiveView()
   lastContentAt = Date.now() // a committed sentence is content — it undims
   transcript?.commitOriginal(trimmed)
-  if (isTargetLang(dominantLang(langs))) {
-    transcript?.commitTranslation(trimmed)
-    dbg.tPass++
-  } else {
-    translationSession?.submitFinal(trimmed)
-  }
+  const passthrough = isTargetLang(dominantLang(langs))
+  if (passthrough) dbg.tPass++
+  translationSession?.submitFinal(trimmed, passthrough)
   appendContextTail(trimmed)
   dbg.commits++
 }
@@ -925,6 +1000,7 @@ async function toggleDisplayMode() {
 function pauseSession() {
   if (paused) return
   paused = true
+  sttGen++ // a pre-pause wake must not replace the manually resumed stream
   bridgeRef?.audioControl(false)
   // Soniox bills connection time, so pausing actually disconnects — silence
   // is never billed. The mid-utterance tail was never committed anyway; drop it.
@@ -937,7 +1013,7 @@ function pauseSession() {
   wakeVerifyPending = false
   clearWakeBuffer()
   runningUi?.setPaused(true)
-  runningUi?.setStatus('listening', 'Paused · glasses frozen on the last turn')
+  runningUi?.setStatus('listening', t('Paused · glasses frozen on the last turn'))
 }
 
 async function resumeSession() {
@@ -996,6 +1072,9 @@ async function endSession() {
   bridgeRef?.audioControl(false)
   const original = transcript?.getFullOriginal().trim()
   const translation = transcript?.getFullTranslation().trim()
+  // Freeze the archive snapshot and stop streamed output immediately;
+  // bridge storage can take longer than the remaining translation work.
+  teardownSession()
   if (original && translation) {
     try {
       await addRecord({
@@ -1013,11 +1092,10 @@ async function endSession() {
       console.error('archiving session failed:', err)
     }
   }
-  teardownSession()
   const exited = await bridgeRef?.shutDownPageContainer(0)
   if (!exited) {
     // Shutdown refused — fall back to the in-app settings screen.
-    ui.showStartError('Exit failed — double-tap the glasses to exit')
+    ui.showStartError(t('Exit failed — double-tap the glasses to exit'))
   }
 }
 

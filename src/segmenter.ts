@@ -17,11 +17,13 @@
 // The one legitimate repeat in the pipeline is a sentence committed early
 // from the draft that later shows up again as its stable-confirmation copy
 // (or still sits in the draft when the next increment lands) — those copies
-// are peeled against the recently-committed set below. That set only ever
-// has to cover a couple of draft sentences, never the conversation: stable
-// text is a one-shot delta, so committed history can never re-enter the
-// workspace and the peel set cannot overflow the way a whole-utterance
-// rescan would.
+// are peeled against the recently-committed set below, which only entries
+// with draft origin carry authority for: final content is sent exactly once
+// by protocol, so a repeat of already-final text is the speaker repeating
+// themselves and displays. That set only ever has to cover a couple of draft
+// sentences, never the conversation: stable text is a one-shot delta, so
+// committed history can never re-enter the workspace and the peel set
+// cannot overflow the way a whole-utterance rescan would.
 
 import type { CharLangs } from './asr/stt'
 
@@ -52,18 +54,25 @@ export function createSegmenter(callbacks: {
   // set. Holds BOTH forms of every commit: the full scanned span (so a
   // stable-confirmation copy that glues the sentence around new text
   // end-matches it) and the peeled survivor (so a growing re-emission
-  // prefix-matches it and only the growth is new). Reset per session by
-  // creating a fresh Segmenter.
-  const sealed: string[] = []
+  // prefix-matches it and only the growth is new). Each entry is tagged with
+  // its origin: fromDraft means the committed span reached into the live
+  // workspace, so the engine still owes the stable confirmation of those
+  // tokens and a repeat of this text IS that confirmation. Final content
+  // (end() tails, pure-stable spans) is sent exactly once by protocol, so a
+  // later repeat of it can only be the speaker repeating themselves and
+  // carries no dedupe authority. Reset per session by creating a fresh
+  // Segmenter.
+  const sealed: { text: string; fromDraft: boolean }[] = []
 
-  function markSealed(segment: string): void {
-    sealed.push(segment)
+  function markSealed(segment: string, fromDraft: boolean): void {
+    sealed.push({ text: segment, fromDraft })
     if (sealed.length > 24) sealed.shift()
   }
 
-  // A standalone commit must span at least this many chars (measured from the
-  // previous commit, punctuation included). Shorter clauses ride along and
-  // merge into the next span — stray ASR punctuation doesn't chop the flow.
+  // A standalone commit must span at least this many CONTENT chars (normSpan:
+  // punctuation never counts toward the bar — "test." is a 4-char word, not a
+  // sentence). Shorter clauses ride along and merge into the next span —
+  // stray ASR punctuation doesn't chop the flow.
   const MIN_SENT_CHARS = 5
   const ASCII_BREAKS = '.!?…,'
   const CJK_BREAKS = '。！？，'
@@ -143,9 +152,16 @@ export function createSegmenter(callbacks: {
   // wholesale (same), because none of the text is new.
   function findRepeated(text: string): { prev: string; same: boolean; fromEnd: boolean } | undefined {
     const norm = normSpan(text)
-    for (const prev of sealed) {
+    for (const { text: prev, fromDraft } of sealed) {
+      // Only draft-origin entries carry dedupe authority: final content is
+      // sent exactly once by protocol, so a later repeat of it is real
+      // speech ("Stop it." ... "Stop it.") and must display.
+      if (!fromDraft) continue
       const normPrev = normSpan(prev)
-      if (!normPrev) continue
+      // Sub-sentence entries carry no dedupe authority: a sealed short word
+      // ("test") would otherwise peel its own head off every later sentence
+      // that happens to start with it ("test xxxx" → "xxxx").
+      if (normPrev.length < MIN_SENT_CHARS) continue
       if (norm === normPrev) return { prev, same: true, fromEnd: false }
       if (norm.startsWith(normPrev) || norm.endsWith(normPrev))
         return { prev, same: false, fromEnd: norm.endsWith(normPrev) }
@@ -199,11 +215,14 @@ export function createSegmenter(callbacks: {
     for (let i = 0; i < full.length; i++) {
       if (!isBreak(full, i)) continue
       const span = full.slice(lastEnd, i + 1)
-      if (span.trim().length < MIN_SENT_CHARS) continue // merge into the next span
+      if (normSpan(span).length < MIN_SENT_CHARS) continue // merge into the next span
       const peeled = peelRepeated(span)
-      if (peeled.text.trim().length >= MIN_SENT_CHARS) {
-        markSealed(span)
-        if (peeled.text !== span) markSealed(peeled.text)
+      if (normSpan(peeled.text).length >= MIN_SENT_CHARS) {
+        // A span reaching past the stable boundary carries live-draft text,
+        // so its stable confirmation is still owed — dedupe authority on.
+        const fromDraft = i + 1 > stable.length
+        markSealed(span, fromDraft)
+        if (peeled.text !== span) markSealed(peeled.text, fromDraft)
         commitClause(peeled.text, lastEnd + peeled.cutFrom, langs)
       }
       lastEnd = i + 1
@@ -248,11 +267,12 @@ export function createSegmenter(callbacks: {
       for (let i = 0; i < full.length; i++) {
         if (!isBreak(full, i)) continue
         const span = full.slice(lastEnd, i + 1)
-        if (span.trim().length < MIN_SENT_CHARS) continue
+        if (normSpan(span).length < MIN_SENT_CHARS) continue
         const peeled = peelRepeated(span)
-        if (peeled.text.trim().length >= MIN_SENT_CHARS) {
-          markSealed(span)
-          if (peeled.text !== span) markSealed(peeled.text)
+        if (normSpan(peeled.text).length >= MIN_SENT_CHARS) {
+          // end() commits final content only — no confirmation is ever owed.
+          markSealed(span, false)
+          if (peeled.text !== span) markSealed(peeled.text, false)
           commitClause(peeled.text, lastEnd + peeled.cutFrom, allLangs)
         }
         lastEnd = i + 1
@@ -267,9 +287,9 @@ export function createSegmenter(callbacks: {
       const remainder = full.slice(lastEnd)
       if (remainder.trim()) {
         const peeled = peelRepeated(remainder)
-        if (peeled.text.trim().length >= MIN_SENT_CHARS) {
-          markSealed(remainder)
-          if (peeled.text !== remainder) markSealed(peeled.text)
+        if (normSpan(peeled.text).length >= MIN_SENT_CHARS) {
+          markSealed(remainder, false)
+          if (peeled.text !== remainder) markSealed(peeled.text, false)
           commitClause(peeled.text, lastEnd + peeled.cutFrom, allLangs)
           stable = ''
           stableLangs = []
@@ -285,6 +305,12 @@ export function createSegmenter(callbacks: {
         stable = ''
         stableLangs = []
       }
+      // The boundary settles every draft debt — tokens still unconfirmed were
+      // delivered in this response's tail — so draft-origin entries lose
+      // their dedupe authority: any later repeat is real speech. Runs AFTER
+      // the tail scan, which may still peel confirmation copies out of the
+      // tail itself.
+      for (const entry of sealed) entry.fromDraft = false
     },
 
     getPendingText() {

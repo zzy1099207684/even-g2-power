@@ -7,46 +7,54 @@ import { listRecords, getRecord, deleteRecord, type SessionRecord } from './hist
 import {
   DEFAULT_HISTORY_MAX_RECORDS,
   DEFAULT_HISTORY_RETENTION_DAYS,
+  DEFAULT_SCREEN_CLEAR_SECONDS,
+  MIN_SCREEN_CLEAR_SECONDS,
   saveUiConfig,
   type ModelProfile,
   type SessionConfig,
   type UiConfig,
 } from './config'
+import { getUiLang, setUiLang, t, tf } from './i18n'
 
 // Bound to Soniox stt-rt-v5 (60+ languages with per-token language
-// identification — Chinese included, which the previous Deepgram model
-// couldn't do).
+// identification, including Chinese). `label` is the English display name (also the archived-record
+// form), `zh` its Chinese counterpart picked by the UI-language toggle.
 const ASR_LANGUAGES = [
-  { code: 'zh', label: 'Chinese' },
-  { code: 'en', label: 'English' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'fr', label: 'French' },
-  { code: 'de', label: 'German' },
-  { code: 'hi', label: 'Hindi' },
-  { code: 'ru', label: 'Russian' },
-  { code: 'pt', label: 'Portuguese' },
-  { code: 'ja', label: 'Japanese' },
-  { code: 'it', label: 'Italian' },
-  { code: 'nl', label: 'Dutch' },
+  { code: 'zh', label: 'Chinese', zh: '中文' },
+  { code: 'en', label: 'English', zh: '英语' },
+  { code: 'es', label: 'Spanish', zh: '西班牙语' },
+  { code: 'fr', label: 'French', zh: '法语' },
+  { code: 'de', label: 'German', zh: '德语' },
+  { code: 'hi', label: 'Hindi', zh: '印地语' },
+  { code: 'ru', label: 'Russian', zh: '俄语' },
+  { code: 'pt', label: 'Portuguese', zh: '葡萄牙语' },
+  { code: 'ja', label: 'Japanese', zh: '日语' },
+  { code: 'it', label: 'Italian', zh: '意大利语' },
+  { code: 'nl', label: 'Dutch', zh: '荷兰语' },
 ]
 
 // Any language DeepSeek writes well is a valid target; the ASR list above is
 // the one bound to the Soniox model.
 const TARGET_LANGUAGES = [
-  { code: 'zh-Hans', label: 'Chinese (Simplified)' },
-  { code: 'zh-Hant', label: 'Chinese (Traditional)' },
-  { code: 'en', label: 'English' },
-  { code: 'ja', label: 'Japanese' },
-  { code: 'ko', label: 'Korean' },
-  { code: 'de', label: 'German' },
-  { code: 'fr', label: 'French' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'ru', label: 'Russian' },
-  { code: 'pt', label: 'Portuguese' },
-  { code: 'it', label: 'Italian' },
-  { code: 'nl', label: 'Dutch' },
-  { code: 'hi', label: 'Hindi' },
+  { code: 'zh-Hans', label: 'Chinese (Simplified)', zh: '简体中文' },
+  { code: 'zh-Hant', label: 'Chinese (Traditional)', zh: '繁体中文' },
+  { code: 'en', label: 'English', zh: '英语' },
+  { code: 'ja', label: 'Japanese', zh: '日语' },
+  { code: 'ko', label: 'Korean', zh: '韩语' },
+  { code: 'de', label: 'German', zh: '德语' },
+  { code: 'fr', label: 'French', zh: '法语' },
+  { code: 'es', label: 'Spanish', zh: '西班牙语' },
+  { code: 'ru', label: 'Russian', zh: '俄语' },
+  { code: 'pt', label: 'Portuguese', zh: '葡萄牙语' },
+  { code: 'it', label: 'Italian', zh: '意大利语' },
+  { code: 'nl', label: 'Dutch', zh: '荷兰语' },
+  { code: 'hi', label: 'Hindi', zh: '印地语' },
 ]
+
+// Display name for a language entry, in the companion UI's language.
+function langLabel(l: { label: string; zh: string }): string {
+  return getUiLang() === 'zh' ? l.zh : l.label
+}
 
 // Selection survives leaving and re-entering the settings screen (record
 // detail, running session). The service configuration (relay, Soniox key,
@@ -62,6 +70,10 @@ let selectedModelId = ''
 // restored config says otherwise.
 let historyRetentionDays = DEFAULT_HISTORY_RETENTION_DAYS
 let historyMaxRecords = DEFAULT_HISTORY_MAX_RECORDS
+// Seconds of content silence before the glasses' screen clears to a fresh
+// page (Settings → Display). Defaults until a saved or restored config says
+// otherwise.
+let screenClearSeconds = DEFAULT_SCREEN_CLEAR_SECONDS
 
 type StatusKind = 'listening' | 'error'
 
@@ -69,8 +81,8 @@ export interface RunningUiHandle {
   setStatus(kind: StatusKind, text: string): void
   /** Sealed original lines plus the live (still-revising) line — synced incrementally. */
   setOriginalMirror(sealed: readonly string[], current: string): void
-  /** Sealed translation lines — synced incrementally. */
-  setTranslationMirror(sealed: readonly string[]): void
+  /** Sealed translation lines plus the currently streaming sentence. */
+  setTranslationMirror(sealed: readonly string[], current: string): void
   setPaused(paused: boolean): void
   /** TEMPORARY: STT pipeline diagnostics, remove after debugging. */
   setDebug(text: string): void
@@ -126,18 +138,18 @@ function langBarText(): string {
 function beginSession(callbacks: UiCallbacks, errorEl: HTMLParagraphElement): void {
   const sources = [...selectedSources]
   if (sources.length < 1 || sources.length > 3) {
-    errorEl.textContent = 'Pick 1 to 3 languages to listen for.'
+    errorEl.textContent = t('Pick 1 to 3 languages to listen for.')
     return
   }
   // Everything the relay and session need is user-provided — nothing is
   // baked in, so refuse to start until Settings has it all.
   const missing: string[] = []
-  if (!relayUrl.trim()) missing.push('relay URL')
-  if (!sonioxKey.trim()) missing.push('Soniox key')
-  if (!models.length) missing.push('a model')
-  else if (!getSelectedModel()) missing.push('a selected model')
+  if (!relayUrl.trim()) missing.push(t('relay URL'))
+  if (!sonioxKey.trim()) missing.push(t('Soniox key'))
+  if (!models.length) missing.push(t('a model'))
+  else if (!getSelectedModel()) missing.push(t('a selected model'))
   if (missing.length) {
-    errorEl.textContent = `Configure in Settings: ${missing.join(', ')}.`
+    errorEl.textContent = `${t('Configure in Settings')}: ${missing.join(', ')}.`
     return
   }
   errorEl.textContent = ''
@@ -149,6 +161,7 @@ function beginSession(callbacks: UiCallbacks, errorEl: HTMLParagraphElement): vo
     relayUrl: relayUrl.trim().replace(/\/+$/, ''),
     sonioxKey: sonioxKey.trim(),
     model,
+    screenClearSeconds,
   })
 }
 
@@ -162,6 +175,8 @@ function fullConfig(): UiConfig {
     activeModelId: selectedModelId,
     historyRetentionDays,
     historyMaxRecords,
+    screenClearSeconds,
+    uiLang: getUiLang(),
   }
 }
 
@@ -208,12 +223,12 @@ const MODEL_PRESETS = [
 // switches the model for the next translation request, mid-session included.
 function modelSelectHtml(idAttr: string): string {
   if (!models.length) {
-    return `<select id="${idAttr}" class="modelSelect" disabled><option>No models — open Settings</option></select>`
+    return `<select id="${idAttr}" class="modelSelect" disabled><option>${t('No models — open Settings')}</option></select>`
   }
   const options = models
     .map(
       m =>
-        `<option value="${escapeHtml(m.id)}" ${m.id === selectedModelId ? 'selected' : ''}>${escapeHtml(m.label || m.name || '(unnamed model)')}</option>`,
+        `<option value="${escapeHtml(m.id)}" ${m.id === selectedModelId ? 'selected' : ''}>${escapeHtml(m.label || m.name || t('(unnamed model)'))}</option>`,
     )
     .join('')
   return `<select id="${idAttr}" class="modelSelect">${options}</select>`
@@ -237,7 +252,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
     showConnecting() {
       app.innerHTML = `
         <main class="panel">
-          <div class="status status-connecting">Connecting…</div>
+          <div class="status status-connecting">${t('Connecting…')}</div>
         </main>
       `
     },
@@ -247,6 +262,8 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       if (err) err.textContent = message
     },
     applyConfig(config) {
+      // UI language first — everything re-rendered below picks it up.
+      if (config.uiLang === 'zh' || config.uiLang === 'en') setUiLang(config.uiLang)
       // Stored codes can go stale if the language lists change — keep only
       // ones the current lists know.
       const valid = config.sources.filter(c => ASR_LANGUAGES.some(l => l.code === c))
@@ -266,6 +283,8 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
         historyRetentionDays = config.historyRetentionDays
       if (typeof config.historyMaxRecords === 'number' && config.historyMaxRecords >= 1)
         historyMaxRecords = config.historyMaxRecords
+      if (typeof config.screenClearSeconds === 'number' && config.screenClearSeconds >= MIN_SCREEN_CLEAR_SECONDS)
+        screenClearSeconds = config.screenClearSeconds
       // Re-render only while the user is still on the settings screen — they
       // may already be past it by the time the bridge wakes up.
       if (app.querySelector('#startBtn')) renderSettings(app, callbacks)
@@ -275,26 +294,26 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
         <main class="panel">
           <header>
             <h1>G2 Translate</h1>
-            <div id="status" class="status status-listening">Microphone live</div>
+            <div id="status" class="status status-listening">${t('Microphone live')}</div>
           </header>
           <section class="mirror">
-            <h2>Original</h2>
+            ${mirrorHeading('Original')}
             <p id="originalMirror" class="mirrorText scrollable"></p>
           </section>
           <section class="mirror">
-            <h2>Translation</h2>
+            ${mirrorHeading('Translation')}
             <p id="translationMirror" class="mirrorText scrollable"></p>
           </section>
           <div class="modelRow">
-            <h2>Model</h2>
+            <h2>${t('Model')}</h2>
             ${modelSelectHtml('runModelSelect')}
           </div>
           <div class="controls">
-            <button id="pauseBtn" class="secondary">Pause</button>
-            <button id="endBtn" class="secondary">End</button>
+            <button id="pauseBtn" class="secondary">${t('Pause')}</button>
+            <button id="endBtn" class="secondary">${t('End')}</button>
           </div>
           <div id="debugLine" class="debugLine"></div>
-          <footer>Tap glasses: toggle layout · swipe: browse history · double-tap: exit</footer>
+          <footer>${t('Tap glasses: toggle layout · swipe: browse history · double-tap: exit')}</footer>
         </main>
       `
       const statusEl = app.querySelector<HTMLDivElement>('#status')!
@@ -304,6 +323,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       const endBtn = app.querySelector<HTMLButtonElement>('#endBtn')!
       const debugEl = app.querySelector<HTMLDivElement>('#debugLine')!
       wireModelSelect(app, 'runModelSelect')
+      wireMirrorCopy(app)
 
       let paused = false
       pauseBtn.addEventListener('click', () => {
@@ -361,12 +381,12 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
         setOriginalMirror(sealed, current) {
           syncOriginalMirror(sealed, current)
         },
-        setTranslationMirror(sealed) {
-          syncTranslationMirror(sealed)
+        setTranslationMirror(sealed, current) {
+          syncTranslationMirror(sealed, current)
         },
         setPaused(next) {
           paused = next
-          pauseBtn.textContent = paused ? 'Resume' : 'Pause'
+          pauseBtn.textContent = paused ? t('Resume') : t('Pause')
         },
         setDebug(text) {
           debugEl.textContent = text
@@ -383,24 +403,32 @@ function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
     <main class="panel">
       <header>
         <h1>G2 Translate</h1>
-        <button id="settingsBtn" class="secondary settingsBtn">Settings</button>
+        <div class="headerBtns">
+          <button id="langToggle" class="secondary settingsBtn">${getUiLang() === 'zh' ? 'EN' : '中文'}</button>
+          <button id="settingsBtn" class="secondary settingsBtn">${t('Settings')}</button>
+        </div>
       </header>
       <section class="records">
-        <h2>History</h2>
+        <h2>${t('History')}</h2>
         <ul id="recordList" class="recordList"></ul>
       </section>
       <button id="langBar" class="langBar" type="button">
         <span class="langBarText">${langBarText()}</span>
       </button>
       <div class="modelRow">
-        <h2>Model</h2>
+        <h2>${t('Model')}</h2>
         ${modelSelectHtml('startModelSelect')}
       </div>
       <p class="error" id="settingsError"></p>
-      <button id="startBtn">Start</button>
+      <button id="startBtn">${t('Start')}</button>
     </main>
   `
 
+  app.querySelector<HTMLButtonElement>('#langToggle')!.addEventListener('click', () => {
+    setUiLang(getUiLang() === 'zh' ? 'en' : 'zh')
+    void saveUiConfig(fullConfig())
+    renderSettings(app, callbacks)
+  })
   app.querySelector<HTMLButtonElement>('#settingsBtn')!.addEventListener('click', () =>
     renderSettingsPage(app, callbacks),
   )
@@ -418,7 +446,7 @@ function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
   const listEl = app.querySelector<HTMLUListElement>('#recordList')!
   listRecords().then(records => {
     if (!records.length) {
-      listEl.innerHTML = `<li class="empty">No saved sessions yet.</li>`
+      listEl.innerHTML = `<li class="empty">${t('No saved sessions yet.')}</li>`
       return
     }
     listEl.innerHTML = records.map(recordItemHtml).join('')
@@ -435,7 +463,19 @@ function renderSettings(app: HTMLDivElement, callbacks: UiCallbacks) {
 }
 
 function sourceLabels(codes: string[]): string {
-  return codes.map(c => ASR_LANGUAGES.find(l => l.code === c)?.label ?? c).join(', ')
+  return codes
+    .map(c => {
+      const l = ASR_LANGUAGES.find(x => x.code === c)
+      return l ? langLabel(l) : c
+    })
+    .join(', ')
+}
+
+// Archived records store the English target label; show it in the current UI
+// language when it's one we know, pass it through otherwise.
+function storedTargetLabel(label: string): string {
+  const l = TARGET_LANGUAGES.find(x => x.label === label)
+  return l ? langLabel(l) : label
 }
 
 // Bottom-sheet language picker (opened from the compact bar): header shows
@@ -456,24 +496,24 @@ function renderLangSheet(app: HTMLDivElement, callbacks: UiCallbacks) {
         <div class="langSheetHead"><span class="langBarText">${langBarText()}</span></div>
         <div class="sheetCols">
           <div class="sheetCol">
-            <h2>Listen for <span class="hintInline">up to 3</span></h2>
+            <h2>${t('Listen for')} <span class="hintInline">${t('up to 3')}</span></h2>
             <div class="chipList">
               ${ASR_LANGUAGES.map(
                 l => `
                 <button type="button" class="chip ${selectedSources.has(l.code) ? 'active' : ''}" data-kind="src" data-code="${l.code}">
-                  <span>${l.label}</span><span class="hintInline">${l.code}</span>
+                  <span>${langLabel(l)}</span><span class="hintInline">${l.code}</span>
                 </button>
               `,
               ).join('')}
             </div>
           </div>
           <div class="sheetCol">
-            <h2>Translate to</h2>
+            <h2>${t('Translate to')}</h2>
             <div class="chipList">
               ${TARGET_LANGUAGES.map(
                 l => `
                 <button type="button" class="chip ${l.code === selectedTarget ? 'active' : ''}" data-kind="tgt" data-code="${l.code}">
-                  <span>${l.label}</span><span class="hintInline">${l.code.split('-')[0]}</span>
+                  <span>${langLabel(l)}</span><span class="hintInline">${l.code.split('-')[0]}</span>
                 </button>
               `,
               ).join('')}
@@ -481,7 +521,7 @@ function renderLangSheet(app: HTMLDivElement, callbacks: UiCallbacks) {
           </div>
         </div>
         <p class="error" id="sheetError"></p>
-        <button id="sheetStart" type="button">Start</button>
+        <button id="sheetStart" type="button">${t('Start')}</button>
       </div>
     `
 
@@ -493,7 +533,7 @@ function renderLangSheet(app: HTMLDivElement, callbacks: UiCallbacks) {
         if (chip.dataset.kind === 'src') {
           if (selectedSources.has(code)) selectedSources.delete(code)
           else if (selectedSources.size >= 3) {
-            hint.textContent = 'Up to 3 languages — drop one first.'
+            hint.textContent = t('Up to 3 languages — drop one first.')
             return
           } else selectedSources.add(code)
         } else {
@@ -526,45 +566,54 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
   app.innerHTML = `
     <main class="panel">
       <header>
-        <button id="settingsBack" class="secondary backBtn">Back</button>
-        <h1 class="detailTitle">Settings</h1>
+        <button id="settingsBack" class="secondary backBtn">${t('Back')}</button>
+        <h1 class="detailTitle">${t('Settings')}</h1>
       </header>
       <div class="pageBody">
         <label class="field">
-          <h2>Relay URL</h2>
+          <h2>${t('Relay URL')}</h2>
           <input id="relayInput" class="editTarget" type="text" inputmode="url" readonly
             autocomplete="off" spellcheck="false"
             placeholder="https://your-worker.workers.dev" value="${escapeHtml(relayUrl)}" />
         </label>
         <label class="field">
-          <h2>Soniox API Key</h2>
+          <h2>${t('Soniox API Key')}</h2>
           <input id="sonioxKeyInput" class="editTarget" type="password" readonly inputmode="none"
             autocomplete="off" spellcheck="false"
-            placeholder="Your Soniox key" value="${escapeHtml(sonioxKey)}" />
+            placeholder="${t('Your Soniox key')}" value="${escapeHtml(sonioxKey)}" />
         </label>
         <div class="fieldHeader">
-          <h2>History</h2>
+          <h2>${t('History')}</h2>
         </div>
         <label class="field">
-          <h2>Keep sessions for (days)</h2>
+          <h2>${t('Keep sessions for (days)')}</h2>
           <input id="historyDaysInput" class="hDays editTarget" type="number" inputmode="numeric" readonly
             autocomplete="off" spellcheck="false"
             placeholder="${DEFAULT_HISTORY_RETENTION_DAYS}" value="${historyRetentionDays}" />
         </label>
         <label class="field">
-          <h2>Keep at most (sessions)</h2>
+          <h2>${t('Keep at most (sessions)')}</h2>
           <input id="historyCountInput" class="hCount editTarget" type="number" inputmode="numeric" readonly
             autocomplete="off" spellcheck="false"
             placeholder="${DEFAULT_HISTORY_MAX_RECORDS}" value="${historyMaxRecords}" />
         </label>
         <div class="fieldHeader">
-          <h2>Translation models</h2>
-          <button id="addModelBtn" class="secondary settingsBtn">+ Add</button>
+          <h2>${t('Display')}</h2>
+        </div>
+        <label class="field">
+          <h2>${t('Clear screen after silence (seconds)')}</h2>
+          <input id="screenClearInput" class="sClear editTarget" type="number" inputmode="numeric" readonly
+            autocomplete="off" spellcheck="false"
+            placeholder="${DEFAULT_SCREEN_CLEAR_SECONDS}" value="${screenClearSeconds}" />
+        </label>
+        <div class="fieldHeader">
+          <h2>${t('Translation models')}</h2>
+          <button id="addModelBtn" class="secondary settingsBtn">${t('+ Add')}</button>
         </div>
         <div id="modelRows" class="modelRows"></div>
       </div>
       <p class="error" id="modalError"></p>
-      <button id="modalSave">Save</button>
+      <button id="modalSave">${t('Save')}</button>
     </main>
   `
 
@@ -589,37 +638,37 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
               p => `<option value="${p.key}" ${p.key === key ? 'selected' : ''}>${p.label}</option>`,
             ).join('')}
           </select>
-          <button class="recordDelete removeModel" aria-label="Remove">✕</button>
+          <button class="recordDelete removeModel" aria-label="${t('Remove')}">✕</button>
         </div>
         <input class="mLabel editTarget" type="text" readonly inputmode="none"
           autocomplete="off" spellcheck="false"
-          placeholder="NAME (shown in the list, e.g. DeepSeek)" value="${escapeHtml(profile?.label ?? '')}" />
+          placeholder="${t('NAME (shown in the list, e.g. DeepSeek)')}" value="${escapeHtml(profile?.label ?? '')}" />
         <input class="mModel editTarget" type="text" readonly inputmode="none"
           autocomplete="off" spellcheck="false" list="ids-${escapeHtml(id || 'new')}"
-          placeholder="MODEL ID (pick or type, e.g. deepseek-v4-flash)" value="${escapeHtml(profile?.name ?? '')}" />
+          placeholder="${t('MODEL ID (pick or type, e.g. deepseek-v4-flash)')}" value="${escapeHtml(profile?.name ?? '')}" />
         <datalist id="ids-${escapeHtml(id || 'new')}">
           ${ids.map(i => `<option value="${escapeHtml(i)}"></option>`).join('')}
         </datalist>
         <input class="mUrl editTarget" type="text" inputmode="url" readonly
           autocomplete="off" spellcheck="false"
-          placeholder="URL (e.g. https://api.deepseek.com/chat/completions)" value="${escapeHtml(profile?.url ?? '')}" />
+          placeholder="${t('URL (e.g. https://api.deepseek.com/chat/completions)')}" value="${escapeHtml(profile?.url ?? '')}" />
         <input class="mKey editTarget" type="password" readonly inputmode="none"
           autocomplete="off" spellcheck="false"
-          placeholder="API KEY" value="${escapeHtml(profile?.key ?? '')}" />
+          placeholder="${t('API KEY')}" value="${escapeHtml(profile?.key ?? '')}" />
         <input class="mExtra editTarget" type="text" readonly inputmode="none"
           autocomplete="off" spellcheck="false"
-          placeholder='EXTRA PARAMS (optional JSON, e.g. {"thinking":{"type":"disabled"}} to disable thinking)'
+          placeholder="${t('EXTRA PARAMS (optional JSON, e.g. {"thinking":{"type":"disabled"}} to disable thinking)')}"
           value="${escapeHtml(profile?.extraParams ? JSON.stringify(profile.extraParams) : '')}" />
         <input class="mEffort editTarget" type="text" readonly inputmode="none"
           autocomplete="off" spellcheck="false"
-          placeholder="REASONING EFFORT (optional, e.g. low / high / max for GLM-5.3+)"
+          placeholder="${t('REASONING EFFORT (optional, e.g. low / high / max for GLM-5.3+)')}"
           value="${escapeHtml(profile?.reasoningEffort ?? '')}" />
       </div>
     `
   }
 
   if (!models.length) {
-    rows.innerHTML = `<p class="empty">No models yet — add the one you want to translate with.</p>`
+    rows.innerHTML = `<p class="empty">${t('No models yet — add the one you want to translate with.')}</p>`
   } else {
     rows.innerHTML = models.map(m => modelCardHtml(m)).join('')
   }
@@ -672,7 +721,8 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
   function openEditor(src: HTMLInputElement) {
     app.querySelector('.editScrim')?.remove()
     const label =
-      src.closest('.field')?.querySelector('h2')?.textContent ?? fieldNames[src.className.split(' ')[0]] ?? 'Edit'
+      src.closest('.field')?.querySelector('h2')?.textContent ??
+      t(fieldNames[src.className.split(' ')[0]] ?? 'Edit')
     const scrim = document.createElement('div')
     scrim.className = 'editScrim'
     scrim.innerHTML = `
@@ -685,8 +735,8 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
             autocomplete="off" spellcheck="false"
             ${src.getAttribute('list') ? `list="${escapeHtml(src.getAttribute('list')!)}"` : ''}
             placeholder="${escapeHtml(src.placeholder)}" value="${escapeHtml(src.value)}" />
-          <button class="editCancel secondary settingsBtn">Cancel</button>
-          <button class="editOk settingsBtn">OK</button>
+          <button class="editCancel secondary settingsBtn">${t('Cancel')}</button>
+          <button class="editOk settingsBtn">${t('OK')}</button>
         </div>
       </div>
     `
@@ -729,11 +779,23 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
     const days = daysRaw === '' ? DEFAULT_HISTORY_RETENTION_DAYS : Number(daysRaw)
     const count = countRaw === '' ? DEFAULT_HISTORY_MAX_RECORDS : Number(countRaw)
     if (!Number.isInteger(days) || days < 1) {
-      errorEl.textContent = 'History days must be a whole number of 1 or more.'
+      errorEl.textContent = t('History days must be a whole number of 1 or more.')
       return
     }
     if (!Number.isInteger(count) || count < 1) {
-      errorEl.textContent = 'History record cap must be a whole number of 1 or more.'
+      errorEl.textContent = t('History record cap must be a whole number of 1 or more.')
+      return
+    }
+
+    // Screen clear: blank falls back to the default; anything else must be a
+    // whole number ≥ MIN_SCREEN_CLEAR_SECONDS — below that the idle marker's
+    // big-dot phase could never show before the screen clears.
+    const clearRaw = app.querySelector<HTMLInputElement>('#screenClearInput')!.value.trim()
+    const clearSeconds = clearRaw === '' ? DEFAULT_SCREEN_CLEAR_SECONDS : Number(clearRaw)
+    if (!Number.isInteger(clearSeconds) || clearSeconds < MIN_SCREEN_CLEAR_SECONDS) {
+      errorEl.textContent = tf('Screen clear must be a whole number of {min} seconds or more.', {
+        min: MIN_SCREEN_CLEAR_SECONDS,
+      })
       return
     }
 
@@ -747,11 +809,13 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
         try {
           extraParams = JSON.parse(rawExtra) as Record<string, unknown>
         } catch {
-          errorEl.textContent = `"${card.querySelector<HTMLInputElement>('.mLabel')!.value.trim() || 'New model'}": extra params are not valid JSON.`
+          errorEl.textContent = tf('"{label}": extra params are not valid JSON.', {
+            label: card.querySelector<HTMLInputElement>('.mLabel')!.value.trim() || t('New model'),
+          })
           return
         }
         if (!extraParams || typeof extraParams !== 'object' || Array.isArray(extraParams)) {
-          errorEl.textContent = 'Extra params must be a JSON object, e.g. {"thinking":{"type":"disabled"}}.'
+          errorEl.textContent = t('Extra params must be a JSON object, e.g. {"thinking":{"type":"disabled"}}.')
           return
         }
       }
@@ -769,18 +833,20 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
       }
       if (!profile.label && !profile.name && !profile.url && !profile.key) continue // blank card — drop
       if (!profile.label || !profile.name || !profile.url || !profile.key) {
-        errorEl.textContent = 'Each model needs a name, model ID, URL, and key — fill it in or remove it.'
+        errorEl.textContent = t('Each model needs a name, model ID, URL, and key — fill it in or remove it.')
         return
       }
       if (!isHttpUrl(profile.url)) {
-        errorEl.textContent = `"${profile.label}": the URL doesn't look like a valid http(s) address.`
+        errorEl.textContent = tf('"{label}": the URL doesn\'t look like a valid http(s) address.', {
+          label: profile.label,
+        })
         return
       }
       next.push(profile)
     }
 
     if (relay && !isHttpUrl(relay)) {
-      errorEl.textContent = "The relay URL doesn't look like a valid http(s) address."
+      errorEl.textContent = t("The relay URL doesn't look like a valid http(s) address.")
       return
     }
 
@@ -789,6 +855,7 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
     models = next
     historyRetentionDays = days
     historyMaxRecords = count
+    screenClearSeconds = clearSeconds
     if (!models.some(m => m.id === selectedModelId)) selectedModelId = models[0]?.id ?? ''
 
     void saveUiConfig(fullConfig())
@@ -807,10 +874,10 @@ function recordItemHtml(r: SessionRecord): string {
   return `
     <li class="recordItem">
       <div class="recordMain" data-id="${r.id}">
-        <div class="recordTitle">${sourceLabels(r.sourceLangs)} → ${r.targetLang} · ${formatTime(r.savedAt)}</div>
+        <div class="recordTitle">${sourceLabels(r.sourceLangs)} → ${storedTargetLabel(r.targetLang)} · ${formatTime(r.savedAt)}</div>
         <div class="recordPreview">${escapeHtml(preview)}</div>
       </div>
-      <button class="recordDelete" data-id="${r.id}" aria-label="Delete">✕</button>
+      <button class="recordDelete" data-id="${r.id}" aria-label="${t('Delete')}">✕</button>
     </li>
   `
 }
@@ -822,26 +889,27 @@ async function renderRecordDetail(app: HTMLDivElement, callbacks: UiCallbacks, i
   app.innerHTML = `
     <main class="panel">
       <header>
-        <button id="backBtn" class="secondary backBtn">Back</button>
-        <h1 class="detailTitle">${escapeHtml(`${sourceLabels(record.sourceLangs)} → ${record.targetLang}`)}</h1>
+        <button id="backBtn" class="secondary backBtn">${t('Back')}</button>
+        <h1 class="detailTitle">${escapeHtml(`${sourceLabels(record.sourceLangs)} → ${storedTargetLabel(record.targetLang)}`)}</h1>
       </header>
       <p class="detailTime">${formatTime(record.savedAt)}</p>
       <section class="mirror">
-        <h2>Original</h2>
+        ${mirrorHeading('Original')}
         <p class="mirrorText scrollable"></p>
       </section>
       <section class="mirror">
-        <h2>Translation</h2>
+        ${mirrorHeading('Translation')}
         <p class="mirrorText scrollable"></p>
       </section>
       <div class="controls">
-        <button id="detailDelete" class="secondary">Delete</button>
+        <button id="detailDelete" class="secondary">${t('Delete')}</button>
       </div>
     </main>
   `
   const mirrors = app.querySelectorAll<HTMLParagraphElement>('.mirrorText')
   mirrors[0].textContent = record.original
   mirrors[1].textContent = record.translation
+  wireMirrorCopy(app)
   app.querySelector<HTMLButtonElement>('#backBtn')!.addEventListener('click', () =>
     renderSettings(app, callbacks),
   )
@@ -849,6 +917,101 @@ async function renderRecordDetail(app: HTMLDivElement, callbacks: UiCallbacks, i
     await deleteRecord(record.id)
     renderSettings(app, callbacks)
   })
+}
+
+function mirrorHeading(label: 'Original' | 'Translation'): string {
+  const copyLabel = t(label === 'Original' ? 'Copy original' : 'Copy translation')
+  return `
+    <div class="mirrorHeading">
+      <h2>${t(label)}</h2>
+      <button type="button" class="mirrorCopy" aria-label="${copyLabel}" title="${copyLabel}">
+        <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <defs>
+            <linearGradient id="copyGlass${label}" x1="0" y1="0" x2="1" y2="1">
+              <stop stop-color="#fff" stop-opacity=".28"/>
+              <stop offset="1" stop-color="#fff" stop-opacity=".06"/>
+            </linearGradient>
+          </defs>
+          <g stroke="#E5E5E5" stroke-width=".8" stroke-linejoin="round">
+            <path d="M14 3h8l6 6v14a2 2 0 0 1-2 2H14a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"
+              fill="url(#copyGlass${label})" stroke-opacity=".45"/>
+            <path d="M22 3v6h6" fill="#fff" fill-opacity=".16" stroke-opacity=".45"/>
+            <path d="M6 10h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V12a2 2 0 0 1 2-2Z"
+              fill="url(#copyGlass${label})" stroke-opacity=".7"/>
+            <path d="M14 10v6h6" fill="#fff" fill-opacity=".22" stroke-opacity=".65"/>
+          </g>
+        </svg>
+      </button>
+      <span class="copyFeedback" role="status" aria-live="polite"></span>
+    </div>
+  `
+}
+
+function wireMirrorCopy(app: HTMLDivElement): void {
+  for (const mirror of app.querySelectorAll<HTMLElement>('.mirror')) {
+    const button = mirror.querySelector<HTMLButtonElement>('.mirrorCopy')!
+    const text = mirror.querySelector<HTMLElement>('.mirrorText')!
+    const feedback = mirror.querySelector<HTMLElement>('.copyFeedback')!
+    let feedbackTimer: ReturnType<typeof setTimeout> | undefined
+    button.addEventListener('click', async () => {
+      clearTimeout(feedbackTimer)
+      // Live mirrors contain a div per line; textContent alone would join words
+      // across line boundaries. Archived mirrors already contain plain text.
+      const content = text.childElementCount
+        ? Array.from(text.children, line => line.textContent ?? '').join('\n')
+        : text.textContent ?? ''
+      if (!content.trim()) {
+        feedback.textContent = t('No text to copy')
+      } else {
+        button.disabled = true
+        try {
+          await copyText(content)
+          feedback.textContent = t('Copied')
+        } catch {
+          feedback.textContent = t('Copy failed. Try again.')
+        } finally {
+          button.disabled = false
+        }
+      }
+      feedbackTimer = setTimeout(() => { feedback.textContent = '' }, 2500)
+    })
+  }
+}
+
+async function copyText(content: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(content)
+      return
+    } catch {
+      // Some embedded WebViews deny the async API but allow user-triggered copy.
+    }
+  }
+  // LAN HTTP preview pages have no Clipboard API. Keep the selection fallback
+  // inside the click flow, with a read-only field so mobile keyboards stay shut.
+  const focused = document.activeElement
+  const selection = window.getSelection()
+  const ranges = selection
+    ? Array.from({ length: selection.rangeCount }, (_, i) => selection.getRangeAt(i).cloneRange())
+    : []
+  const field = document.createElement('textarea')
+  field.value = content
+  field.readOnly = true
+  field.style.cssText = 'position:fixed;top:0;left:0;opacity:0;pointer-events:none;font-size:16px'
+  document.body.appendChild(field)
+  try {
+    field.focus({ preventScroll: true })
+    field.select()
+    field.setSelectionRange(0, field.value.length)
+    if (!document.execCommand('copy')) throw new Error('Clipboard copy failed')
+  } finally {
+    field.remove()
+    if (focused instanceof HTMLElement) focused.focus({ preventScroll: true })
+    if (selection) {
+      selection.removeAllRanges()
+      for (const range of ranges) selection.addRange(range)
+    }
+  }
 }
 
 function escapeHtml(text: string): string {
@@ -932,6 +1095,19 @@ function injectStyles() {
 
     .mirror { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
       background: #1A1A1A; border: 1px solid #2E2E2E; border-radius: 12px; padding: 16px; }
+    .mirrorHeading { position: relative; display: flex; align-items: center; flex-shrink: 0;
+      min-height: 20px; margin-bottom: 8px; }
+    .mirrorHeading h2 { margin: 0; }
+    .mirrorCopy { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px;
+      margin: -12px -12px -12px auto; padding: 8px; background: transparent; color: #E5E5E5; }
+    .mirrorCopy svg { width: 28px; height: 28px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.25)); }
+    .mirrorCopy:active { background: rgba(255,255,255,.08); }
+    .mirrorCopy:focus-visible { outline: 2px solid #FEF991; outline-offset: -2px; }
+    .mirrorCopy:disabled { cursor: wait; opacity: .6; }
+    @media (hover: hover) { .mirrorCopy:hover { background: rgba(255,255,255,.06); } }
+    .copyFeedback { position: absolute; right: 36px; top: 0; max-width: calc(100% - 36px);
+      background: #1A1A1A; color: #E5E5E5; font-size: 12px; line-height: 20px; }
+    .copyFeedback:not(:empty) { padding: 0 6px; }
     .mirrorText { margin: 0; font-size: 16px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; min-height: 24px; }
     .mirrorText.scrollable { flex: 1 1 0; min-height: 0; overflow-y: auto; }
     .debugLine { font-size: 11px; color: #7B7B7B; text-align: center; min-height: 14px; }
@@ -939,6 +1115,7 @@ function injectStyles() {
 
     /* Model switching (Start + running screens). */
     .settingsBtn { padding: 8px 14px; font-size: 13px; font-weight: 600; }
+    .headerBtns { display: flex; gap: 8px; }
     .modelRow { display: flex; flex-direction: column; }
     .modelSelect { width: 100%; background: #1A1A1A; color: #E5E5E5; border: 1px solid #2E2E2E;
       border-radius: 8px; padding: 10px 12px; font-size: 14px; }

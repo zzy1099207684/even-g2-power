@@ -28,11 +28,22 @@
 // back transcribed in its own language and the filter below drops it, so the
 // display stays silent instead of forcing the words into a hinted language
 // (with `language_hints_strict` the model could only emit hinted languages, so
-// Chinese speech arrived as misheard English). The filter is now the only net:
-// tokens tagged with a language outside `languageHints` are dropped. Cost of
-// dropping strict: heavily accented speech in a hinted language is occasionally
-// mis-tagged to another language and lost the same way. Tokens with no language
-// (spaces, punctuation, markers) are kept.
+// Chinese speech arrived as misheard English). Three nets drop tokens before
+// they reach the caller: tokens carrying letters from a writing system none of
+// the hinted languages uses, tokens tagged with a language outside
+// `languageHints`, and tokens whose per-token `confidence` (0.0-1.0) is under
+// MIN_TOKEN_CONFIDENCE. The script net exists because the tag net alone is
+// not trustworthy: with hints set, the model emits unselected-language speech
+// as its own script but mislabels the tokens with a hinted language (observed:
+// nearby Chinese speech arrived as accurate, confident tokens tagged `en`), so
+// the token's visible characters are the only reliable signal. Far-field or
+// muffled audio additionally comes back as low-confidence tokens even when
+// tagged to a hinted language, so the model's own uncertainty is what keeps
+// misheard noise off the screen. Cost of the nets: heavily accented speech is
+// occasionally lost the same way, and source speech may not borrow words
+// written in another selected language's script. Tokens with no language
+// (spaces, punctuation, markers) are kept unless their own confidence is
+// under the floor.
 //
 // That per-token language also reaches the caller: the callbacks carry a
 // per-character language array parallel to the text (entries are undefined for
@@ -42,6 +53,41 @@
 
 /** Per-character source language, parallel to a callback's text. */
 export type CharLangs = (string | undefined)[]
+
+// Tokens scoring below this are treated as misheard noise (far-field or
+// muffled speech) and dropped. Starting guess — tune against the debug
+// overlay's drop feed on a real session.
+export const MIN_TOKEN_CONFIDENCE = 0.82
+
+// One regex per writing system a hinted language can produce. Letters only:
+// digits and punctuation are language-neutral and never drop a token, so a
+// transcript keeps its numbers and marks whatever the session's languages.
+const TOKEN_SCRIPTS: [string, RegExp][] = [
+  ['lat', /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/],
+  ['cyr', /[\u0400-\u04FF]/],
+  ['deva', /[\u0900-\u097F]/],
+  ['han', /[\u3400-\u9FFF\uF900-\uFAFF]/],
+  ['kana', /[\u3040-\u30FF]/],
+  ['hang', /[\uAC00-\uD7AF]/],
+]
+
+// The writing systems each hint language is written in (ja carries kanji).
+// A hint outside this map turns the script net off entirely — filtering a
+// language the map does not know would be guesswork.
+const LANG_SCRIPTS: Record<string, string[]> = {
+  en: ['lat'],
+  es: ['lat'],
+  fr: ['lat'],
+  de: ['lat'],
+  pt: ['lat'],
+  it: ['lat'],
+  nl: ['lat'],
+  ru: ['cyr'],
+  hi: ['deva'],
+  zh: ['han'],
+  ja: ['kana', 'han'],
+  ko: ['hang'],
+}
 
 export interface SttClient {
   sendPcm(chunk: Uint8Array): void
@@ -61,7 +107,8 @@ export interface StartSonioxStreamOptions {
   /** Fires once per `<end>`: the utterance's never-confirmed remainder. */
   onEnd(tail: string, langs: CharLangs): void
   onError?: (err: unknown) => void
-  /** Diagnostics: a token dropped by the language-hints filter (text, tagged language). */
+  /** Diagnostics: a token dropped by one of the nets (text, reason: script /
+   *  tag language / 'conf'). */
   onDrop?(text: string, lang: string): void
 }
 
@@ -69,6 +116,7 @@ interface SonioxToken {
   text?: string
   language?: string
   is_final?: boolean
+  confidence?: number
 }
 
 interface SonioxMessage {
@@ -81,11 +129,18 @@ interface SonioxMessage {
 export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise<SttClient> {
   const ws = new WebSocket('wss://stt-rt.soniox.com/transcribe-websocket')
   const allowed = new Set(opts.languageHints.map(code => code.toLowerCase()))
+  // Script net's allow-set. Off unless every hint is a language the map
+  // knows — filtering an unknown language would be guesswork.
+  const scriptNetOn =
+    opts.languageHints.length > 0 && opts.languageHints.every(code => LANG_SCRIPTS[code.toLowerCase()] !== undefined)
+  const allowedScripts = new Set(
+    scriptNetOn ? opts.languageHints.flatMap(code => LANG_SCRIPTS[code.toLowerCase()]) : [],
+  )
 
   const sendPcm = (chunk: Uint8Array) => {
     // Frames arriving before the handshake completes are dropped — the mic
     // only comes up after the page is built anyway.
-    if (ws.readyState === WebSocket.OPEN) ws.send(chunk)
+    if (ws.readyState === WebSocket.OPEN) ws.send(chunk as Uint8Array<ArrayBuffer>)
   }
 
   return new Promise<SttClient>((resolve, reject) => {
@@ -159,11 +214,28 @@ export async function startSonioxStream(opts: StartSonioxStreamOptions): Promise
         }
         // Structural stream opener — no text, never part of a transcript.
         if (token.text === '<docroot>') continue
-        if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) {
-          opts.onDrop?.(token.text ?? '', token.language)
+        const text = token.text ?? ''
+        // Script net — shape-based, independent of the (mislabel-prone)
+        // language tag: letters from a writing system no hinted language
+        // uses cannot be this session's speech, however the token is labeled.
+        if (scriptNetOn && TOKEN_SCRIPTS.some(([name, re]) => re.test(text) && !allowedScripts.has(name))) {
+          opts.onDrop?.(text, 'script')
           continue
         }
-        const text = token.text ?? ''
+        if (token.language && allowed.size > 0 && !allowed.has(token.language.toLowerCase())) {
+          opts.onDrop?.(text, token.language)
+          continue
+        }
+        // Low-confidence net. Word-shaped tokens only: spaces carry a score
+        // too, and dropping them would glue neighbouring words together.
+        if (
+          token.confidence !== undefined &&
+          token.confidence < MIN_TOKEN_CONFIDENCE &&
+          /\S/.test(text)
+        ) {
+          opts.onDrop?.(text, 'conf')
+          continue
+        }
         if (token.is_final) {
           delta += text
           for (let i = 0; i < text.length; i++) deltaLangs.push(token.language)

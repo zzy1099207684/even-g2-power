@@ -1,14 +1,14 @@
 {
   "package_id": "com.zzy.g2translate",
   "edition": "202601",
-  "name": "G2 Translate",
-  "version": "0.1.0",
+  "name": "G2 translate plus",
+  "version": "0.1.8",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
     { "name": "g2-microphone", "desc": "Capture speech near the user for live translation." },
-    { "name": "network", "desc": "Fetch a short-lived Deepgram session token and stream translations through the relay; stream speech directly to Deepgram for transcription.", "whitelist": ["https://g2-translate-relay.zzy1099207684.workers.dev", "wss://api.deepgram.com"] }
+    { "name": "network", "desc": "Stream speech directly to Soniox for transcription and translate text through the relay.", "whitelist": ["https://g2-translate-relay.zzy1099207684.workers.dev", "wss://stt-rt.soniox.com"] }
   ],
   "supported_languages": ["en"]
 }

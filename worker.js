@@ -1,6 +1,6 @@
 // 通用中转: worker 自身不保存任何密钥. 每个用户部署自己的一份,
-// 应用在每次请求里带上自己的 Deepgram key 和模型配置 (OpenAI 兼容的
-// chat/completions 接口), worker 只负责转发.
+// 应用在每次请求里带上自己的模型配置 (OpenAI 兼容的
+// chat/completions 接口), worker 只负责转发. 语音识别由应用直连 Soniox.
 // 注意: 本文件只是仓库里的记录, 部署靠手动把内容粘贴到 Cloudflare.
 
 export default {
@@ -9,34 +9,11 @@ export default {
     const cors = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      // X-Deepgram-Key 是自定义头, GET /deepgram-token 会先触发预检
-      'Access-Control-Allow-Headers': 'Content-Type, X-Deepgram-Key',
+      'Access-Control-Allow-Headers': 'Content-Type',
     }
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: cors })
-    }
-
-    // 手机app开麦前, 先拿请求头里的 Deepgram key 换一个30~60秒的临时通行证,
-    // 拿着它直连Deepgram. master key 只出现在这一次请求里.
-    if (url.pathname === '/deepgram-token' && request.method === 'GET') {
-      const key = request.headers.get('X-Deepgram-Key')
-      if (!key) {
-        return new Response('missing X-Deepgram-Key header', { status: 400, headers: cors })
-      }
-      const resp = await fetch('https://api.deepgram.com/v1/auth/grant', {
-        method: 'POST',
-        headers: {
-          Authorization: `Token ${key}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ttl_seconds: 60 }),
-      })
-      const data = await resp.text()
-      return new Response(data, {
-        status: resp.status,
-        headers: { ...cors, 'Content-Type': 'application/json' },
-      })
     }
 
     // app把识别出的一段文字(+可选的已定稿前文 +模型配置)发过来, 原样转发到

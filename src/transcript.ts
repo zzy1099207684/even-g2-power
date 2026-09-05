@@ -29,10 +29,16 @@ const SEALED_TAIL_CHARS = 1000
 
 export interface Transcript {
   updateCurrentOriginal(text: string): void
+  /** Replace the oldest pending sentence's streamed translation. */
+  updateCurrentTranslation(text: string): void
   /** Original sealed into the log (clause cut, length backstop or EndOfTurn). */
   commitOriginal(text: string): void
   /** Translation finalized for the oldest original still waiting to be paired. */
   commitTranslation(text: string): void
+  /** Fresh live view after a long silence: clears both lane tails and the
+   *  draft line. Sealed history, pairing queue and scroll position are
+   *  untouched — scrolling and the phone mirror still reach everything. */
+  cutLiveView(): void
 
   scrollOlder(): void
   scrollNewer(): void
@@ -49,6 +55,7 @@ export interface Transcript {
   getTranslationLines(): readonly string[]
   /** The still-revising live original line, '' when nothing is live. */
   getCurrentOriginal(): string
+  getCurrentTranslation(): string
 }
 
 // Sealed + current join with a newline: every sealed segment starts on its
@@ -81,6 +88,7 @@ export function createTranscript(): Transcript {
   // back, so several can be waiting when the next translation lands.
   const pendingOriginals: string[] = []
   let currentOriginal = ''
+  let currentTranslation = ''
   // Cached tails of the sealed lanes (last SEALED_TAIL_CHARS chars) —
   // rebuilt incrementally on commit, so per-partial glasses reads stay O(1)
   // in conversation length.
@@ -119,6 +127,10 @@ export function createTranscript(): Transcript {
       currentOriginal = text
       scrollBack = 0
     },
+    updateCurrentTranslation(text) {
+      currentTranslation = text
+      scrollBack = 0
+    },
     commitOriginal(text) {
       origLines.push(text)
       origTail = appendTail(origTail, text)
@@ -129,9 +141,19 @@ export function createTranscript(): Transcript {
     commitTranslation(text) {
       const original = pendingOriginals.shift()
       if (original === undefined) return // no sealed original waiting — nothing to pair it with
+      currentTranslation = ''
       transLines.push(text)
       transTail = appendTail(transTail, text)
       scrollBack = 0
+    },
+    // The live view restarting after a long silence: the tails rebuild from
+    // the next commits, while the scrolled view and the phone mirror keep
+    // reading the full sealed log.
+    cutLiveView() {
+      origTail = ''
+      transTail = ''
+      currentOriginal = ''
+      currentTranslation = ''
     },
     scrollOlder() {
       scrollBack = Math.min(scrollBack + 1, transLines.length)
@@ -146,7 +168,7 @@ export function createTranscript(): Transcript {
       return scrollBack === 0 ? joinLane(origTail, currentOriginal) : scrolled(i => origLines[i])
     },
     getGlassesTranslation() {
-      return scrollBack === 0 ? transTail : scrolled(i => transLines[i])
+      return scrollBack === 0 ? joinLane(transTail, currentTranslation) : scrolled(i => transLines[i])
     },
     getFullOriginal() {
       return joinLane(origLines.join('\n'), currentOriginal)
@@ -162,6 +184,9 @@ export function createTranscript(): Transcript {
     },
     getCurrentOriginal() {
       return currentOriginal
+    },
+    getCurrentTranslation() {
+      return currentTranslation
     },
   }
 }
