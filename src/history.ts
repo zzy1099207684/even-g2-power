@@ -16,6 +16,7 @@ export interface SessionRecord {
   targetLang: string // translation target, as a natural-language name
   original: string
   translation: string
+  summary?: string
 }
 
 const STORAGE_KEY = 'g2-translate-history'
@@ -71,7 +72,18 @@ export async function getRecord(id: string): Promise<SessionRecord | null> {
   return (await listRecords()).find(r => r.id === id) ?? null
 }
 
+export async function saveRecordSummary(id: string, summary: string): Promise<void> {
+  const records = await readRecords()
+  if (records === null) throw new Error('history read failed')
+  const record = records.find(r => r.id === id)
+  if (!record) throw new Error('record not found')
+  record.summary = summary
+  await persist(records)
+}
+
 async function persist(records: SessionRecord[]): Promise<void> {
   const bridge = await waitForEvenAppBridge()
-  await bridge.setLocalStorage(STORAGE_KEY, JSON.stringify(records))
+  if (!await bridge.setLocalStorage(STORAGE_KEY, JSON.stringify(records))) {
+    throw new Error('history write failed')
+  }
 }

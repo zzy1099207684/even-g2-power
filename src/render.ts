@@ -68,6 +68,8 @@ export function fitTail(text: string, innerWidth: number, maxLines: number): str
 export interface ContainerRenderer {
   /** Debounced pixel-fit write to the glasses. */
   schedule(rawText: string): void
+  /** Send pending text now; resolves after this write leaves the shared queue. */
+  flush(): Promise<unknown>
   /** Update the geometry used by future schedule() calls. */
   setBox(box: ContainerBox): void
   /** Forget the last written content so the next schedule() writes again. */
@@ -132,6 +134,13 @@ export function createContainerRenderer(
       pendingText = text
       if (timer !== null) return
       timer = setTimeout(writeNow, DEBOUNCE_MS)
+    },
+    flush() {
+      if (timer !== null) {
+        clearTimeout(timer)
+        writeNow()
+      }
+      return queue.current
     },
     setBox(newBox) {
       box = newBox

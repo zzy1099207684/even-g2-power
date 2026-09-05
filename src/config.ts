@@ -47,6 +47,7 @@ export interface UiConfig {
   /** Companion-UI language ('en' | 'zh'). Optional in stored payloads —
    *  loadUiConfig resolves absent values to 'en'. */
   uiLang?: string
+  summaryEnabled?: boolean
 }
 
 // Defaults applied when a config predates the history-retention fields or
@@ -66,6 +67,7 @@ export interface SessionConfig {
   model: ModelProfile
   /** Seconds of silence before the glasses' live view clears to a fresh page. */
   screenClearSeconds: number
+  summaryEnabled?: boolean
 }
 
 const STORAGE_KEY = 'g2-translate-config'
@@ -115,6 +117,7 @@ export async function loadUiConfig(): Promise<UiConfig | null> {
           ? parsed.screenClearSeconds
           : DEFAULT_SCREEN_CLEAR_SECONDS,
       uiLang: parsed.uiLang === 'zh' ? 'zh' : 'en',
+      summaryEnabled: parsed.summaryEnabled === true,
     }
   } catch {
     return null // no saved config yet, or storage unavailable — defaults apply

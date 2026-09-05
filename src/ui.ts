@@ -3,7 +3,8 @@
 // detail view. Pure DOM rendering — no SDK/bridge calls here; persistence goes
 // through the async record helpers in history.ts.
 
-import { listRecords, getRecord, deleteRecord, type SessionRecord } from './history'
+import { listRecords, getRecord, deleteRecord, saveRecordSummary, type SessionRecord } from './history'
+import { generateSummary } from './summary'
 import {
   DEFAULT_HISTORY_MAX_RECORDS,
   DEFAULT_HISTORY_RETENTION_DAYS,
@@ -74,6 +75,7 @@ let historyMaxRecords = DEFAULT_HISTORY_MAX_RECORDS
 // page (Settings → Display). Defaults until a saved or restored config says
 // otherwise.
 let screenClearSeconds = DEFAULT_SCREEN_CLEAR_SECONDS
+let summaryEnabled = false
 
 type StatusKind = 'listening' | 'error'
 
@@ -90,6 +92,8 @@ export interface RunningUiHandle {
 
 export interface UiHandle {
   showConnecting(): void
+  showEnding(summarizing: boolean): void
+  showHome(message?: string): void
   showStartError(message: string): void
   showRunning(): RunningUiHandle
   /** Apply the restored last-used selection; re-renders only if on settings. */
@@ -162,6 +166,7 @@ function beginSession(callbacks: UiCallbacks, errorEl: HTMLParagraphElement): vo
     sonioxKey: sonioxKey.trim(),
     model,
     screenClearSeconds,
+    summaryEnabled,
   })
 }
 
@@ -176,6 +181,7 @@ function fullConfig(): UiConfig {
     historyRetentionDays,
     historyMaxRecords,
     screenClearSeconds,
+    summaryEnabled,
     uiLang: getUiLang(),
   }
 }
@@ -249,6 +255,22 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
   renderSettings(app, callbacks)
 
   return {
+    showHome(message = '') {
+      renderSettings(app, callbacks)
+      app.querySelector<HTMLElement>('#settingsError')!.textContent = message
+    },
+    showEnding(summarizing) {
+      app.innerHTML = `
+        <main class="panel">
+          <header><h1>G2 Translate</h1></header>
+          <section class="endingContent" aria-busy="true" role="status" aria-live="polite">
+            <span class="summarySpinner" aria-hidden="true"></span>
+            <h2>${t(summarizing ? 'Generating AI summary…' : 'Saving session…')}</h2>
+            <p class="hint">${t('Returning home when ready.')}</p>
+          </section>
+        </main>
+      `
+    },
     showConnecting() {
       app.innerHTML = `
         <main class="panel">
@@ -274,6 +296,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       // scheme normalization existed are healed here.
       relayUrl = withHttps(config.relayUrl)
       sonioxKey = config.sonioxKey
+      summaryEnabled = config.summaryEnabled === true
       models = config.models.filter(isProfile).map(m => ({ ...m, url: withHttps(m.url) }))
       if (models.some(m => m.id === config.activeModelId)) selectedModelId = config.activeModelId
       else selectedModelId = models[0]?.id ?? ''
@@ -298,11 +321,11 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
           </header>
           <section class="mirror">
             ${mirrorHeading('Original')}
-            <p id="originalMirror" class="mirrorText scrollable"></p>
+            <div id="originalMirror" class="mirrorText scrollable"></div>
           </section>
           <section class="mirror">
             ${mirrorHeading('Translation')}
-            <p id="translationMirror" class="mirrorText scrollable"></p>
+            <div id="translationMirror" class="mirrorText scrollable"></div>
           </section>
           <div class="modelRow">
             <h2>${t('Model')}</h2>
@@ -317,8 +340,8 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
         </main>
       `
       const statusEl = app.querySelector<HTMLDivElement>('#status')!
-      const originalEl = app.querySelector<HTMLParagraphElement>('#originalMirror')!
-      const translationEl = app.querySelector<HTMLParagraphElement>('#translationMirror')!
+      const originalEl = app.querySelector<HTMLDivElement>('#originalMirror')!
+      const translationEl = app.querySelector<HTMLDivElement>('#translationMirror')!
       const pauseBtn = app.querySelector<HTMLButtonElement>('#pauseBtn')!
       const endBtn = app.querySelector<HTMLButtonElement>('#endBtn')!
       const debugEl = app.querySelector<HTMLDivElement>('#debugLine')!
@@ -347,7 +370,7 @@ export function mountUi(callbacks: UiCallbacks): UiHandle {
       // bottom — scrolling up to read history must not be yanked back down;
       // scrolling back to the bottom resumes following.
       const MIRROR_MAX_LINES = 300
-      const makeMirrorSync = (el: HTMLParagraphElement) => {
+      const makeMirrorSync = (el: HTMLDivElement) => {
         let count = 0
         let liveEl: HTMLDivElement | null = null
         return (sealed: readonly string[], current?: string) => {
@@ -600,6 +623,11 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
         <div class="fieldHeader">
           <h2>${t('Display')}</h2>
         </div>
+        <label class="switchRow">
+          <span>${t('AI summary')}</span>
+          <input id="summaryEnabledInput" type="checkbox" role="switch" ${summaryEnabled ? 'checked' : ''} />
+          <span class="switchTrack" aria-hidden="true"></span>
+        </label>
         <label class="field">
           <h2>${t('Clear screen after silence (seconds)')}</h2>
           <input id="screenClearInput" class="sClear editTarget" type="number" inputmode="numeric" readonly
@@ -856,6 +884,7 @@ function renderSettingsPage(app: HTMLDivElement, callbacks: UiCallbacks) {
     historyRetentionDays = days
     historyMaxRecords = count
     screenClearSeconds = clearSeconds
+    summaryEnabled = app.querySelector<HTMLInputElement>('#summaryEnabledInput')!.checked
     if (!models.some(m => m.id === selectedModelId)) selectedModelId = models[0]?.id ?? ''
 
     void saveUiConfig(fullConfig())
@@ -893,23 +922,56 @@ async function renderRecordDetail(app: HTMLDivElement, callbacks: UiCallbacks, i
         <h1 class="detailTitle">${escapeHtml(`${sourceLabels(record.sourceLangs)} → ${storedTargetLabel(record.targetLang)}`)}</h1>
       </header>
       <p class="detailTime">${formatTime(record.savedAt)}</p>
-      <section class="mirror">
-        ${mirrorHeading('Original')}
-        <p class="mirrorText scrollable"></p>
-      </section>
-      <section class="mirror">
-        ${mirrorHeading('Translation')}
-        <p class="mirrorText scrollable"></p>
-      </section>
+      <div class="mirrorStack">
+        ${summaryEnabled ? mirrorPanel('AI summary', 'summaryMirror', true, record.summary || t('No summary yet.')) : ''}
+        ${mirrorPanel('Original', 'originalMirror', !summaryEnabled, record.original)}
+        ${mirrorPanel('Translation', 'translationMirror', !summaryEnabled, record.translation)}
+      </div>
       <div class="controls">
         <button id="detailDelete" class="secondary">${t('Delete')}</button>
       </div>
     </main>
   `
-  const mirrors = app.querySelectorAll<HTMLParagraphElement>('.mirrorText')
-  mirrors[0].textContent = record.original
-  mirrors[1].textContent = record.translation
+  wireMirrorToggles(app)
   wireMirrorCopy(app)
+  if (summaryEnabled && !record.summary) {
+    const summaryBody = app.querySelector<HTMLElement>('#summaryMirrorBody')!
+    const summaryText = app.querySelector<HTMLElement>('#summaryMirror')!
+    const copy = summaryBody.closest('.mirror')!.querySelector<HTMLButtonElement>('.mirrorCopy')!
+    copy.disabled = true
+    const retry = document.createElement('button')
+    retry.className = 'secondary summaryRetry'
+    retry.textContent = t('Generate summary')
+    retry.disabled = !record.original.trim()
+    summaryBody.appendChild(retry)
+    retry.addEventListener('click', async () => {
+      const model = getSelectedModel()
+      if (!relayUrl || !model) {
+        summaryText.textContent = t('Configure a relay and model in Settings first.')
+        return
+      }
+      const back = app.querySelector<HTMLButtonElement>('#backBtn')!
+      const remove = app.querySelector<HTMLButtonElement>('#detailDelete')!
+      retry.disabled = back.disabled = remove.disabled = true
+      retry.textContent = t('Generating AI summary…')
+      retry.classList.add('isGenerating')
+      summaryBody.setAttribute('aria-busy', 'true')
+      try {
+        const summary = await generateSummary(record.original, record.targetLang, relayUrl, model)
+        await saveRecordSummary(record.id, summary)
+        summaryText.textContent = summary
+        copy.disabled = false
+        retry.remove()
+      } catch {
+        summaryText.textContent = t('Summary failed. Try again.')
+      } finally {
+        retry.disabled = back.disabled = remove.disabled = false
+        retry.classList.remove('isGenerating')
+        retry.textContent = t('Generate summary')
+        summaryBody.removeAttribute('aria-busy')
+      }
+    })
+  }
   app.querySelector<HTMLButtonElement>('#backBtn')!.addEventListener('click', () =>
     renderSettings(app, callbacks),
   )
@@ -919,25 +981,55 @@ async function renderRecordDetail(app: HTMLDivElement, callbacks: UiCallbacks, i
   })
 }
 
-function mirrorHeading(label: 'Original' | 'Translation'): string {
-  const copyLabel = t(label === 'Original' ? 'Copy original' : 'Copy translation')
+type MirrorLabel = 'Original' | 'Translation' | 'AI summary'
+
+function mirrorPanel(label: MirrorLabel, id: string, expanded: boolean, content = ''): string {
+  return `
+    <section class="mirror${expanded ? '' : ' collapsed'}">
+      ${mirrorHeading(label, `${id}Body`, expanded)}
+      <div id="${id}Body" class="mirrorBody" ${expanded ? '' : 'hidden'}>
+        <div id="${id}" class="mirrorText scrollable">${escapeHtml(content)}</div>
+      </div>
+    </section>
+  `
+}
+
+function wireMirrorToggles(app: HTMLDivElement): void {
+  for (const button of app.querySelectorAll<HTMLButtonElement>('.mirrorToggle')) {
+    button.addEventListener('click', () => {
+      const mirror = button.closest('.mirror')!
+      const body = mirror.querySelector<HTMLElement>('.mirrorBody')!
+      const expanded = button.getAttribute('aria-expanded') !== 'true'
+      button.setAttribute('aria-expanded', String(expanded))
+      mirror.classList.toggle('collapsed', !expanded)
+      body.hidden = !expanded
+    })
+  }
+}
+
+function mirrorHeading(label: MirrorLabel, bodyId?: string, expanded = true): string {
+  const copyLabel = t(label === 'Original' ? 'Copy original' : label === 'Translation' ? 'Copy translation' : 'Copy summary')
+  const glassId = label.replaceAll(' ', '')
   return `
     <div class="mirrorHeading">
-      <h2>${t(label)}</h2>
+      <h2>${bodyId ? `<button type="button" class="mirrorToggle" aria-expanded="${expanded}" aria-controls="${bodyId}">
+        <svg class="foldChevron" viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg>
+        ${t(label)}
+      </button>` : t(label)}</h2>
       <button type="button" class="mirrorCopy" aria-label="${copyLabel}" title="${copyLabel}">
         <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
           <defs>
-            <linearGradient id="copyGlass${label}" x1="0" y1="0" x2="1" y2="1">
+            <linearGradient id="copyGlass${glassId}" x1="0" y1="0" x2="1" y2="1">
               <stop stop-color="#fff" stop-opacity=".28"/>
               <stop offset="1" stop-color="#fff" stop-opacity=".06"/>
             </linearGradient>
           </defs>
           <g stroke="#E5E5E5" stroke-width=".8" stroke-linejoin="round">
             <path d="M14 3h8l6 6v14a2 2 0 0 1-2 2H14a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z"
-              fill="url(#copyGlass${label})" stroke-opacity=".45"/>
+              fill="url(#copyGlass${glassId})" stroke-opacity=".45"/>
             <path d="M22 3v6h6" fill="#fff" fill-opacity=".16" stroke-opacity=".45"/>
             <path d="M6 10h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V12a2 2 0 0 1 2-2Z"
-              fill="url(#copyGlass${label})" stroke-opacity=".7"/>
+              fill="url(#copyGlass${glassId})" stroke-opacity=".7"/>
             <path d="M14 10v6h6" fill="#fff" fill-opacity=".22" stroke-opacity=".65"/>
           </g>
         </svg>
@@ -1093,11 +1185,25 @@ function injectStyles() {
     .detailTitle { flex: 1; min-width: 0; font-size: 15px; text-align: right; }
     .detailTime { margin: -8px 0 0; font-size: 12px; color: #7B7B7B; text-align: right; }
 
+    .mirrorStack { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
+      gap: 16px; overflow-y: auto; }
     .mirror { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column;
       background: #1A1A1A; border: 1px solid #2E2E2E; border-radius: 12px; padding: 16px; }
+    .mirrorStack > .mirror:not(.collapsed) { min-height: 100px; }
+    .mirror.collapsed { flex: 0 0 auto; min-height: 0; }
+    .mirror.collapsed .mirrorHeading { margin-bottom: 0; }
+    .mirrorBody { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+    .mirrorBody[hidden] { display: none; }
     .mirrorHeading { position: relative; display: flex; align-items: center; flex-shrink: 0;
       min-height: 20px; margin-bottom: 8px; }
-    .mirrorHeading h2 { margin: 0; }
+    .mirrorHeading h2 { margin: 0; flex: 1; min-width: 0; }
+    .mirrorToggle { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 44px;
+      margin: -12px 0; padding: 12px 0; background: transparent; color: inherit;
+      font: inherit; letter-spacing: inherit; text-transform: inherit; text-align: left; }
+    .mirrorToggle:focus-visible { outline: 2px solid #FEF991; outline-offset: 2px; }
+    .foldChevron { width: 14px; height: 14px; flex-shrink: 0; fill: none; stroke: currentColor;
+      stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+    .mirrorToggle[aria-expanded="true"] .foldChevron { transform: rotate(90deg); }
     .mirrorCopy { display: grid; place-items: center; flex-shrink: 0; width: 44px; height: 44px;
       margin: -12px -12px -12px auto; padding: 8px; background: transparent; color: #E5E5E5; }
     .mirrorCopy svg { width: 28px; height: 28px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.25)); }
@@ -1110,6 +1216,17 @@ function injectStyles() {
     .copyFeedback:not(:empty) { padding: 0 6px; }
     .mirrorText { margin: 0; font-size: 16px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; min-height: 24px; }
     .mirrorText.scrollable { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+    .summaryRetry { align-self: flex-start; flex-shrink: 0; font-size: 13px; }
+    .summaryRetry:disabled { opacity: .6; cursor: default; }
+    .endingContent { flex: 1; display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: 16px; text-align: center; }
+    .endingContent h2 { margin: 8px 0 0; color: #E5E5E5; font-size: 16px; text-transform: none; }
+    .summarySpinner, .isGenerating::before { display: inline-block; width: 40px; height: 40px;
+      border: 2px solid #2E2E2E; border-top-color: #FEF991; border-radius: 50%;
+      animation: summarySpin .9s linear infinite; }
+    .isGenerating::before { content: ''; width: 12px; height: 12px; margin-right: 8px; vertical-align: middle; }
+    @keyframes summarySpin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) { .summarySpinner, .isGenerating::before { animation: none; } }
     .debugLine { font-size: 11px; color: #7B7B7B; text-align: center; min-height: 14px; }
     footer { font-size: 12px; color: #7B7B7B; text-align: center; }
 
@@ -1125,6 +1242,18 @@ function injectStyles() {
     .pageBody { flex: 1 1 0; min-height: 0; overflow-y: auto;
       display: flex; flex-direction: column; gap: 12px; }
     .field { display: flex; flex-direction: column; }
+    .switchRow { position: relative; display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; min-height: 44px; padding: 8px 16px; background: #1A1A1A;
+      border: 1px solid #2E2E2E; border-radius: 12px; font-size: 14px; cursor: pointer; }
+    .switchRow input { position: absolute; right: 16px; width: 44px; height: 28px;
+      margin: 0; opacity: 0; cursor: pointer; }
+    .switchTrack { width: 44px; height: 26px; flex-shrink: 0; background: #3E3E3E;
+      border-radius: 999px; pointer-events: none; }
+    .switchTrack::before { content: ''; display: block; width: 20px; height: 20px;
+      margin: 3px; border-radius: 50%; background: #E5E5E5; }
+    .switchRow input:checked + .switchTrack { background: #FEF991; }
+    .switchRow input:checked + .switchTrack::before { transform: translateX(18px); background: #111111; }
+    .switchRow input:focus-visible + .switchTrack { outline: 2px solid #FEF991; outline-offset: 3px; }
     .field input, .modelCard input { background: rgba(255,255,255,0.08); color: #E5E5E5;
       border: none; border-radius: 8px; padding: 10px 12px; font-size: 14px; width: 100%;
       box-sizing: border-box; }

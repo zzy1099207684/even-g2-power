@@ -9,7 +9,8 @@ import { startSonioxStream, type CharLangs, type SttClient } from './asr/stt'
 import { createTranslationSession, type TranslationSession } from './translate'
 import { createTranscript, type Transcript } from './transcript'
 import { createSegmenter, type Segmenter } from './segmenter'
-import { addRecord } from './history'
+import { addRecord, saveRecordSummary, type SessionRecord } from './history'
+import { generateSummary } from './summary'
 import {
   DEFAULT_SCREEN_CLEAR_SECONDS,
   MIN_SCREEN_CLEAR_SECONDS,
@@ -122,6 +123,9 @@ let unsubscribe: (() => void) | null = null
 let displayMode: DisplayMode = 'both'
 let paused = false
 let cleanedUp = false
+let ending = false
+let pageCreated = false
+let summaryAbort: AbortController | null = null
 
 // Serializes every glasses write (text + marker image) across one BLE link.
 const writeQueue = createWriteQueue()
@@ -169,6 +173,7 @@ if (dbgCfgRaw) {
         relayUrl: cfg.relayUrl,
         sonioxKey: cfg.sonioxKey,
         model,
+        summaryEnabled: cfg.summaryEnabled === true,
         // Raw debug payload — same normalization loadUiConfig would apply.
         screenClearSeconds:
           typeof cfg.screenClearSeconds === 'number' && cfg.screenClearSeconds >= MIN_SCREEN_CLEAR_SECONDS
@@ -484,6 +489,7 @@ function wrapUiForStatusTracking(ui: RunningUiHandle): RunningUiHandle {
 }
 
 async function handleStart(languages: string[], targetCode: string, targetLabel: string, session: SessionConfig) {
+  if (ending || activeSession || cleanedUp) return
   startLanguages = languages
   startTargetCode = targetCode.split('-')[0] // 'zh-Hans' → 'zh' for the marker
   startTargetLang = targetLabel
@@ -501,12 +507,9 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
   activeSession = session
   if (dbgPcmUrl) void startPcmFeeder(stt)
 
-  // First launch creates the page; `invalid` means the page already exists
-  // (the webview reloaded while the glasses page persisted), so rebuild it
-  // back to the initial layout. Rebuild is mandatory here: writes to a kept
-  // page silently no-op, and the rebuild is what re-arms the containers
-  // (text writes verified working on device across End→Start).
-  const created = await bridge.createStartUpPageContainer(
+  // Create once per app lifetime, then rebuild for each new session.
+  // A page left by a WebView reload also needs the rebuild fallback.
+  const created = pageCreated ? 1 : await bridge.createStartUpPageContainer(
     new CreateStartUpPageContainer({
       containerTotalNum: 3,
       textObject: [originalContainerProps(), translationContainerProps('both'), idleMarkerProps()],
@@ -522,13 +525,19 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
     if (!rebuilt) {
       stt.close()
       stt = null
+      activeSession = null
       ui.showStartError(`createStartUpPageContainer failed: ${created}`)
       return
     }
   }
   bridgeRef = bridge
+  pageCreated = true
   displayMode = 'both'
   paused = false
+  sttRetries = 0
+  lastWakeAttemptAt = 0
+  wakeSuppressUntil = 0
+  sendGateOpenUntil = 0
   activeRelayUrl = session.relayUrl
 
   await bridge.audioControl(true)
@@ -614,7 +623,20 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
     return envelope.eventType ?? OsEventTypeList.CLICK_EVENT
   }
 
-  unsubscribe = bridge.onEvenHubEvent(event => {
+  // Keep the exit/lifecycle listener while the phone is on the home or
+  // summary screen. Session gestures and audio stop with activeSession.
+  if (!unsubscribe) unsubscribe = bridge.onEvenHubEvent(event => {
+    const sysType = eventTypeOf(event.sysEvent)
+    const textType = eventTypeOf(event.textEvent)
+    if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+      bridge.shutDownPageContainer(1)
+      return
+    }
+    if (sysType === OsEventTypeList.SYSTEM_EXIT_EVENT || sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT) {
+      cleanup()
+      return
+    }
+    if (!activeSession || ending) return
     const pcm = event.audioEvent?.audioPcm
     if (pcm && !dbgPcmUrl) {
       // Room-noise learning runs in every session state — only frames well
@@ -641,14 +663,6 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
       }
     }
 
-    const sysType = eventTypeOf(event.sysEvent)
-    const textType = eventTypeOf(event.textEvent)
-
-    if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
-      bridge.shutDownPageContainer(1)
-      return
-    }
-
     // Scroll gestures carry explicit non-zero type ids and must be matched
     // before CLICK_EVENT, the value an envelope falls back to when it
     // carries no type at all.
@@ -666,10 +680,6 @@ async function handleStart(languages: string[], targetCode: string, targetLabel:
     if (sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT) {
       toggleDisplayMode().catch(err => console.error('toggleDisplayMode failed:', err))
       return
-    }
-
-    if (sysType === OsEventTypeList.SYSTEM_EXIT_EVENT || sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT) {
-      cleanup()
     }
   })
 }
@@ -698,15 +708,19 @@ function renderPhone() {
 // after End (every updateImageRawData sendfails), while text writes keep
 // working. Visible immediately when the session opens; blank while speech
 // or translation is live; back after 5s of silence, blinking its dot. Text
-// has no gray control, so "dim" after markerDimAfterMs of silence means a
-// small dot on a 1-in-4 duty cycle — and the lanes blank at the same point,
+// has no gray control, so "dim" after markerDimAfterMs of silence means
+// small dots spreading outward — and the lanes blank at the same point,
 // leaving just this one strip lit.
 // renderGlasses() repaints the full transcript on the next update, so
 // blanking loses nothing.
 const MARKER_BLINK_MS = 900
+const MARKER_FRAME_MS = MARKER_BLINK_MS / 2
+// Space and · advance 5px. Three outward steps keep the center fixed,
+// using only the original marker strip, then return to one small dot.
+const MARKER_DIM_FRAMES = ['    ·', '   · ·', '  ·   ·', ' ·     ·']
 const MARKER_RETURN_AFTER_MS = 5_000
-// Silence this long blanks the lanes and switches the marker to the slow
-// small dot — and the live view then resets on the next content, so speech
+// Silence this long blanks the lanes and switches to the small-dot
+// animation — and the live view then resets on the next content, so speech
 // resuming opens a fresh page (maybeCutLiveView). Per session from Settings
 // → Display; the default matches the STT idle disconnect (15 s).
 let markerDimAfterMs = DEFAULT_SCREEN_CLEAR_SECONDS * 1_000
@@ -714,6 +728,8 @@ const MARKER_BOX: ContainerBox = { innerWidth: 576, maxLines: 1 }
 
 let markerTimer: ReturnType<typeof setInterval> | null = null
 let markerTicks = 0
+let markerAnimationStartedAt: number | null = null
+let markerFrameWrite: Promise<unknown> | null = null
 let speechStarted = false // cold start shows the marker before the first word
 let lastSpeechAt = 0 // epoch ms of the last recognized or translated update
 // Drives the screen-off (dim) decision, separate from lastSpeechAt: only
@@ -751,16 +767,32 @@ function maybeCutLiveView(): void {
 }
 
 function renderMarker(dim: boolean, dotOn: boolean) {
-  const dot = !dotOn ? '' : dim ? ' ·' : ' ●'
+  // A slow bridge must not queue animation ahead of pause or new speech.
+  if (markerFrameWrite) return
+  if (dim) markerAnimationStartedAt ??= Date.now()
+  else markerAnimationStartedAt = null
+  // Advance by elapsed time, not completed BLE writes. Slow writes skip
+  // stale frames instead of stretching the whole animation into slow motion.
+  const frame = dim ? Math.floor((Date.now() - markerAnimationStartedAt!) / MARKER_FRAME_MS) % MARKER_DIM_FRAMES.length : 0
+  const dot = dim ? ` ${MARKER_DIM_FRAMES[frame]}` : dotOn ? ' ●' : ''
   markerRenderer?.schedule(`${startLanguages.join('/')} → ${startTargetCode}${dot}`)
+  const write = markerRenderer?.flush()
+  if (write) {
+    markerFrameWrite = write
+    void write.finally(() => {
+      if (markerFrameWrite === write) markerFrameWrite = null
+    })
+  }
 }
 
 function hideMarker() {
+  markerAnimationStartedAt = null
   markerRenderer?.schedule('')
 }
 
 function markerTick() {
   if (paused) {
+    markerAnimationStartedAt = null
     // Static pause notice — deliberately not blinking; paused means nothing
     // is live. The lanes stay frozen on the last turn behind it.
     markerRenderer?.schedule(`pause · ${startLanguages.join('/')} → ${startTargetCode}`)
@@ -793,7 +825,8 @@ function markerTick() {
     originalRenderer?.schedule('')
     translationRenderer?.schedule('')
   }
-  renderMarker(dim, markerTicks % (dim ? 4 : 2) === 0)
+  // Two animation ticks per blink preserve the large dot's 900ms cadence.
+  renderMarker(dim, Math.floor((markerTicks - 1) * MARKER_FRAME_MS / MARKER_BLINK_MS) % 2 === 1)
 }
 
 function startIdleBlink() {
@@ -801,8 +834,9 @@ function startIdleBlink() {
   lastContentAt = Date.now()
   speechStarted = false
   markerTicks = 0
+  markerAnimationStartedAt = null
   markerTick()
-  markerTimer = setInterval(markerTick, MARKER_BLINK_MS)
+  markerTimer = setInterval(markerTick, MARKER_FRAME_MS)
 }
 
 // Committing: Soniox treats continuous speech as ONE long utterance — `<end>`
@@ -916,6 +950,7 @@ function appendContextTail(sealed: string): void {
 // failure — relay down, model unconfigured, timeout, a non-"new" answer —
 // is treated as "same": at worst one missed reset, never a wrongful wipe.
 async function checkTopicChange(prev: string, next: string): Promise<void> {
+  const gen = sttGen
   const model = getSelectedModel()
   if (!activeRelayUrl || !model?.url || !model.name || !model.key) return
   const abort = new AbortController()
@@ -929,6 +964,7 @@ async function checkTopicChange(prev: string, next: string): Promise<void> {
     })
     if (!res.ok) return
     const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
+    if (gen !== sttGen || !activeSession) return
     const verdict = (data.choices?.[0]?.message?.content ?? '').trim().toLowerCase()
     if (!verdict.includes('new')) return // "same", or a garbled answer — keep the window
     const parts = contextTail.split('\n')
@@ -1017,11 +1053,19 @@ function pauseSession() {
 }
 
 async function resumeSession() {
-  if (!paused) return
-  if (activeSession) {
+  if (!paused || !activeSession) return
+  const session = activeSession
+  const gen = sttGen
+  if (session) {
     try {
-      stt = await openStt(startLanguages, activeSession)
+      const client = await openStt(startLanguages, session)
+      if (gen !== sttGen || activeSession !== session || cleanedUp) {
+        client.close()
+        return
+      }
+      stt = client
     } catch (err) {
+      if (gen !== sttGen || activeSession !== session || cleanedUp) return
       runningUi?.setStatus('error', `STT error: ${(err as Error)?.message ?? err}`)
       return
     }
@@ -1058,52 +1102,84 @@ function teardownSession() {
   clearWakeBuffer()
   translationSession?.dispose()
   translationSession = null
-  unsubscribe?.()
-  unsubscribe = null
+  originalRenderer?.cancel()
+  translationRenderer?.cancel()
+  markerRenderer?.cancel()
+  originalRenderer = null
+  translationRenderer = null
+  markerRenderer = null
+  markerFrameWrite = null
+  runningUi = null
+  transcript = null
+  segmenter = null
 }
 
-// "End" — archive this session, then close the whole plugin (same mechanism
-// as double-tap exit, minus the confirmation). History is persisted first, so
-// relaunching keeps everything. End exits instead of returning to the
-// settings screen because the device host stops honoring container writes to
-// a page kept open across sessions — a full exit is the only clean stop, and
-// it also frees the glasses display immediately.
+// Save the raw snapshot before asking the model. Stay on the progress screen
+// until the summary is saved (or fails), then return to the in-app home page.
 async function endSession() {
-  bridgeRef?.audioControl(false)
-  const original = transcript?.getFullOriginal().trim()
-  const translation = transcript?.getFullTranslation().trim()
-  // Freeze the archive snapshot and stop streamed output immediately;
-  // bridge storage can take longer than the remaining translation work.
+  if (ending || !activeSession) return
+  ending = true
+  const session = activeSession
+  const model = getSelectedModel() ?? session.model
+  const original = transcript?.getFullOriginal().trim() ?? ''
+  const translation = transcript?.getFullTranslation().trim() ?? ''
+  const shouldSummarize = session.summaryEnabled === true && !!original
+  ui.showEnding(shouldSummarize)
   teardownSession()
-  if (original && translation) {
+  let message = ''
+  try {
+    // Drain already queued writes before blanking the retained glasses page.
+    // It stays alive so a later Start can rebuild it without exiting the app.
     try {
-      await addRecord({
-        // crypto.randomUUID needs a secure context and is absent when the
-        // device loads the app over plain LAN http — derive the id instead.
+      await bridgeRef?.audioControl(false)
+      await writeQueue.current
+      await bridgeRef?.rebuildPageContainer(new RebuildPageContainer({
+        containerTotalNum: 3,
+        textObject: [originalContainerProps(), translationContainerProps('both'), idleMarkerProps()],
+      }))
+    } catch (err) {
+      console.warn('clearing glasses after End failed:', err)
+    }
+    if (original || translation) {
+      const record: SessionRecord = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
         savedAt: Date.now(),
         sourceLangs: startLanguages,
         targetLang: startTargetLang,
         original,
         translation,
-      })
-    } catch (err) {
-      // The user asked to exit — log and go; the record is lost this once.
-      console.error('archiving session failed:', err)
+      }
+      await addRecord(record)
+      if (shouldSummarize && !cleanedUp) {
+        summaryAbort = new AbortController()
+        try {
+          const summary = await generateSummary(original, record.targetLang, session.relayUrl, model, summaryAbort.signal)
+          if (!cleanedUp) await saveRecordSummary(record.id, summary)
+        } catch (err) {
+          console.error('summary failed:', err)
+          message = t('Summary failed. Transcript saved; retry from History.')
+        } finally {
+          summaryAbort = null
+        }
+      }
     }
-  }
-  const exited = await bridgeRef?.shutDownPageContainer(0)
-  if (!exited) {
-    // Shutdown refused — fall back to the in-app settings screen.
-    ui.showStartError(t('Exit failed — double-tap the glasses to exit'))
+  } catch (err) {
+    console.error('archiving session failed:', err)
+    message = t('Could not save this session.')
+  } finally {
+    ending = false
+    if (!cleanedUp) ui.showHome(message)
   }
 }
 
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  summaryAbort?.abort()
   bridgeRef?.audioControl(false)
   teardownSession()
+  unsubscribe?.()
+  unsubscribe = null
 }
 
 window.addEventListener('beforeunload', cleanup)

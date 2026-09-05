@@ -101,7 +101,7 @@ async function startApp() {
     },
     './render': {
       createWriteQueue: () => ({ current: Promise.resolve() }),
-      createContainerRenderer: () => ({ schedule: noOp, cancel: noOp, reset: noOp, setBox: noOp }),
+      createContainerRenderer: () => ({ schedule: noOp, flush: () => Promise.resolve(), cancel: noOp, reset: noOp, setBox: noOp }),
       fitTail: value => value,
     },
   }
